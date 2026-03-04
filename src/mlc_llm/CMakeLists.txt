@@ -65,18 +65,19 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # add_subdirectory(${TVM_SOURCE_DIR} tvm EXCLUDE_FROM_ALL)
 
 # Set TVM_HOME path 这里直接用编译好的TVM库
-set(TVM_SOURCE_DIR 3rdparty/tvm) 
+set(3RDPARTY_DIR ../../3rdparty)
+set(TVM_SOURCE_DIR ${3RDPARTY_DIR}/tvm) 
 include_directories(${TVM_SOURCE_DIR}/include)
 link_directories(${TVM_SOURCE_DIR}/lib)
 
 message(STATUS "TVM_HOME: ${TVM_HOME}")
 
 set(MLC_LLM_RUNTIME_LINKER_LIB "")
-set(TOKENZIER_CPP_PATH 3rdparty/tokenizers-cpp)
+set(TOKENZIER_CPP_PATH ${3RDPARTY_DIR}/tokenizers-cpp)
 add_subdirectory(${TOKENZIER_CPP_PATH} tokenizers EXCLUDE_FROM_ALL)
 
-set(XGRAMMAR_PATH 3rdparty/xgrammar)
-file(GLOB_RECURSE MLC_LLM_SRCS src/*.cc)
+set(XGRAMMAR_PATH ${3RDPARTY_DIR}/xgrammar)
+file(GLOB_RECURSE MLC_LLM_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/*.cc)
 file(GLOB_RECURSE XGRAMMAR_SRCS ${XGRAMMAR_PATH}/cpp/*.cc)
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX "${XGRAMMAR_PATH}/cpp/pybind/.*\\.cc")
 list(APPEND MLC_LLM_SRCS ${XGRAMMAR_SRCS})
@@ -89,6 +90,7 @@ set(MLC_LLM_INCLUDES
     ${TVM_SOURCE_DIR}/3rdparty/dmlc-core/include
     ${TVM_SOURCE_DIR}/3rdparty/picojson
     ${TVM_SOURCE_DIR}/include
+    ${TVM_SOURCE_DIR}/src
     )
 
   # set(MLC_LLM_INCLUDES
@@ -106,7 +108,7 @@ set(MLC_LLM_COMPILE_DEFS ${MLC_LLM_COMPILE_DEFS} XGRAMMAR_ENABLE_LOG_DEBUG=0)
 target_compile_definitions(mlc_llm_objs PRIVATE ${MLC_LLM_COMPILE_DEFS})
 target_compile_definitions(mlc_llm_objs PRIVATE -DMLC_LLM_EXPORTS)
 target_include_directories(mlc_llm_objs PRIVATE ${MLC_LLM_INCLUDES})
-target_include_directories(mlc_llm_objs PRIVATE 3rdparty/stb)
+target_include_directories(mlc_llm_objs PRIVATE ${3RDPARTY_DIR}/stb)
 target_include_directories(mlc_llm_objs PRIVATE ${TOKENZIER_CPP_PATH}/include)
 target_include_directories(mlc_llm_objs PRIVATE ${XGRAMMAR_PATH}/include)
 target_link_libraries(mlc_llm_objs PRIVATE tvm_ffi_header)
@@ -121,7 +123,7 @@ target_link_libraries(mlc_llm PUBLIC)
 target_link_libraries(mlc_llm PRIVATE tokenizers_cpp)
 
 find_library(FLASH_ATTN_LIBRARY flash_attn
-             HINTS ${TVM_SOURCE_DIR}/*/3rdparty/libflash_attn/src)
+             HINTS ${TVM_SOURCE_DIR}/3rdparty/libflash_attn/src)
 
 if(FLASH_ATTN_LIBRARY STREQUAL "FLASH_ATTN_LIBRARY-NOTFOUND")
   message(
