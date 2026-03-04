@@ -1,0 +1,2282 @@
+/*!
+ *  Copyright (c) 2023 by Contributors
+ * \file llm_chat.cc
+ * \brief Implementation of llm chat.
+ */
+#include "llm_chat.h"
+
+#include <picojson.h>
+// TVM 0.23 includes
+#include <tvm/ffi/function.h>
+#include <tvm/runtime/device_api.h>
+#include <tvm/runtime/disco/session.h>
+#include <tvm/runtime/memory/memory_manager.h>
+#include <tvm/runtime/module.h>
+#include <tvm/runtime/tensor.h>
+#include <tvm/runtime/vm/tensor_cache_support.h>
+
+#include <tvm/node/cast.h> // For Downcast
+
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "./metadata/model.h"
+#include "./serve/config.h"
+#include "./support/load_bytes_from_file.h"
+#include "./json_ffi/conversation.h"
+#include "./support/random.h"
+#include "./tokenizers/tokenizers.h"
+#include "./serve/function_table.h"
+#include "./support/load_bytes_from_file.h"
+#include "./support/utils.h"
+
+
+namespace mlc {
+namespace llm {
+
+using tvm::Device;
+using namespace tvm::runtime;
+using namespace tvm;
+using tvm::ffi::Any;//tvm20新增
+using tvm::ffi::Array;//tvm20新增
+using tvm::ffi::Function;//tvm20新增
+using tvm::ffi::Module;//tvm20新增
+using tvm::ffi::Optional;//tvm20新增
+using tvm::ffi::PackedArgs;//tvm20新增
+using tvm::ffi::TypedFunction;//tvm20新增
+using tvm::ffi::Shape;
+using tvm::ffi::Map;
+using tvm::runtime::Tensor;//tvm20新增
+namespace {  //原始代码 要放开
+
+//------------------------------
+// support functions
+//------------------------------
+inline size_t FindEffectiveUTF8Pos(const std::string& s) {
+  int pos = s.size() - 1;
+  for (; pos >= 0; pos--) {
+    if ((s[pos] & 0x80) == 0x00) {
+      return pos + 1;
+    } else if (pos - 1 >= 0 && (s[pos - 1] & 0xE0) == 0xC0 && (s[pos] & 0xC0) == 0x80) {
+      return pos + 1;
+    } else if (pos - 2 >= 0 && (s[pos - 2] & 0xF0) == 0xE0 && (s[pos - 1] & 0xC0) == 0x80 &&
+               (s[pos] & 0xC0) == 0x80) {
+      return pos + 1;
+    } else if (pos - 3 >= 0 && (s[pos - 3] & 0xF8) == 0xF0 && (s[pos - 2] & 0xC0) == 0x80 &&
+               (s[pos - 1] & 0xC0) == 0x80 && (s[pos] & 0xC0) == 0x80) {
+      return pos + 1;
+    }
+  }
+  return pos + 1;
+}
+// // tvm20新增
+// Optional<IntTuple> GetDiscoWorkerCPUBinding(int num_workers) {
+//   const char* raw_cpu_binding = std::getenv("MLC_DISCO_WORKER_CPU_BINDING");
+//   if (raw_cpu_binding == nullptr) {
+//     return std::nullopt;
+//   }
+
+//   std::string cpu_binding_str(raw_cpu_binding);
+//   std::vector<std::string> cpu_ids_str = Split(cpu_binding_str, ',');
+//   std::vector<int64_t> cpu_ids;
+//   for (const std::string& cpu_id_str : cpu_ids_str) {
+//     try {
+//       cpu_ids.push_back(std::stol(cpu_id_str));
+//     } catch (std::invalid_argument const& ex) {
+//       LOG(FATAL) << "Invalid MLC_DISCO_WORKER_CPU_BINDING \"" << cpu_binding_str << "\"";
+//     }
+//   }
+//   if (static_cast<int>(cpu_ids.size()) < num_workers) {
+//     LOG(FATAL) << "Insufficient number of specified CPU workers in MLC_DISCO_WORKER_CPU_BINDING, "
+//                   "expecting at least "
+//                << num_workers << "CPU ids but only " << cpu_ids.size() << " are given.";
+//   }
+
+//   return IntTuple{cpu_ids};
+// }
+
+inline std::string Concat(const std::vector<std::string>& inputs) {
+  std::ostringstream os;
+  for (const auto& x : inputs) {
+    os << x;
+  }
+  return os.str();
+}
+// 这个后期版本写成了function_table.cc和function_table.h
+struct FunctionTable {
+  Function SessionFuncAsPackedFunc(Session sess, DRef sess_func, String name) {
+  return Function([sess, func = std::move(sess_func), name = std::move(name)](
+                      tvm::ffi::PackedArgs args, tvm::ffi::Any* rv) -> void {
+    std::vector<AnyView> packed_args(args.size() + 3);
+    packed_args[0] = static_cast<int>(DiscoAction::kCallPacked);
+    packed_args[1] = 0;
+    packed_args[2] = func;
+    for (int i = 0; i < args.size(); ++i) {
+      packed_args[i + 3] = args[i];
+    }
+    *rv = sess->CallWithPacked(tvm::ffi::PackedArgs(packed_args.data(), packed_args.size()));
+   });
+  }
+
+  void Init(tvm::ffi::AnyView reload_lib, Device device, picojson::object model_config) {
+    Device null_device{DLDeviceType(0), 0};
+    int num_shards;
+    int max_num_stages = 1;
+    {
+      if (model_config.count("tensor_parallel_shards")) {
+        CHECK(model_config["tensor_parallel_shards"].is<int64_t>());
+        num_shards = model_config["tensor_parallel_shards"].get<int64_t>();
+      } else {
+        num_shards = 1;
+      }
+    }
+    this->model_config = model_config;
+
+    if (num_shards > 1) {
+      // String lib_path{nullptr};
+      String lib_path;
+      try {
+        lib_path = reload_lib.cast<String>();
+      } catch (...) {
+        LOG(FATAL)
+            << "ValueError: In multi-GPU inference, we expect the first argument to Reload to be a "
+               "string path to the model library (.so on Linux or .dll on Windows), but got type: "
+            << reload_lib.GetTypeKey();
+      }
+      constexpr const char* f_create_process_pool = "runtime.disco.create_process_pool";
+      if (!Function::GetGlobal(f_create_process_pool).has_value()) {
+        LOG(FATAL) << "Cannot find process launcher `" << f_create_process_pool << "`. "
+                   << "Multi-GPU inference depends on MLC LLM Python API to launch process.";
+      }
+      std::string ccl;
+      if (device.device_type == kDLCUDA) {
+        ccl = "nccl";
+      } else if (device.device_type == kDLROCM) {
+        ccl = "rccl";
+      } else {
+        LOG(FATAL) << "ValueError: Multi-GPU on device " << DLDeviceType2Str(device.device_type)
+                   << " is not supported. Currently, only NCCL and RCCL are integrated.";
+      }
+      std::vector<int64_t> device_ids(num_shards);
+      for (int i = 0; i < num_shards; ++i) {
+        device_ids[i] = i;
+      }
+      this->use_disco = true;
+      this->sess =
+          Session::ProcessSession(num_shards,max_num_stages, f_create_process_pool, "mlc_llm.cli.worker");
+      this->sess->InitCCL(ccl, IntTuple(device_ids));
+      this->disco_mod = sess->CallPacked(sess->GetGlobalFunc("runtime.disco.load_vm_module"),
+                                         lib_path, null_device);
+      this->mod_get_func = [this, fmodule_get_function =
+                                      sess->GetGlobalFunc("ffi.ModuleGetFunction")](
+                               const std::string& name) -> Function {
+        DRef func = sess->CallPacked(fmodule_get_function, this->disco_mod, name, true);
+        bool exists = (func->DebugGetFromRemote(0).as<Function>()) != nullptr;
+        if (!exists) {
+          return Function(nullptr);
+        }
+        return SessionFuncAsPackedFunc(sess, func, name);
+      };
+      this->get_global_func = [this](const std::string& name) -> Function {
+        return SessionFuncAsPackedFunc(sess, sess->GetGlobalFunc(name), name);
+      };
+      this->_InitFunctions();
+      {
+        Module mod = this->disco_mod.value()->DebugGetFromRemote(0).cast<Module>();
+        this->softmax_func_ = mod->GetFunction("softmax_with_temperature").value();
+        this->model_metadata_ = ModelMetadata::FromModule(mod, std::move(model_config));
+      }
+    } else {
+      Optional<Module> executable = std::nullopt;
+      // Try to cast to Module first, if that fails, treat as string path
+      auto module_opt = reload_lib.try_cast<Module>();
+      if (module_opt.has_value()) {
+        executable = module_opt.value();
+      } else {
+        String lib_path = reload_lib.cast<String>();
+        executable = Module::LoadFromFile(lib_path);
+      }
+      this->use_disco = false;
+      auto fload_exec = executable.value()->GetFunction("vm_load_executable");
+      ICHECK(fload_exec.defined()) << "TVM runtime cannot find vm_load_executable";
+      this->local_vm = fload_exec.value()().cast<Module>();
+      this->local_vm.value()
+          ->GetFunction("vm_initialization")
+          .value()(static_cast<int>(device.device_type), device.device_id,
+                   static_cast<int>(memory::AllocatorType::kPooled), static_cast<int>(kDLCPU), 0,
+                   static_cast<int>(memory::AllocatorType::kPooled));
+      // LOG(INFO) << "Using Naive memory allocator for reduced memory footprint";
+      this->mod_get_func = [this](const std::string& name) -> Function {
+        Optional<Function> func = this->local_vm.value()->GetFunction(name, false);
+        return func.value_or(Function(nullptr));
+      };
+      this->get_global_func = [](const std::string& name) -> Function {
+        auto func_opt = Function::GetGlobal(name);
+        return func_opt.value_or(Function(nullptr));
+      };
+      this->model_metadata_ = ModelMetadata::FromModule(this->local_vm.value(), std::move(model_config));
+      this->_InitFunctions();
+    }
+  }
+
+  // void Init(String reload_lib_path, Device device, picojson::object model_config,
+  //                         Optional<Session> session, int num_shards, int num_stages) {
+  //   this->local_gpu_device = device;
+  //   this->model_config = model_config;
+  //   this->cached_buffers = Map<String, ObjectRef>();
+
+  //   int num_workers = num_shards * num_stages;
+  //   if (num_workers > 1) {
+  //     ICHECK(session.defined());
+  //     this->sess = session.value();
+  //     this->use_disco = true;
+  //     this->disco_mod = sess->CallPacked(sess->GetGlobalFunc("runtime.disco.load_vm_module"),
+  //                                       reload_lib_path, Optional<Device>(std::nullopt));
+  //     this->mod_get_func = [this, fmodule_get_function = sess->GetGlobalFunc(
+  //                                     "ffi.ModuleGetFunction")](const std::string& name) -> Function {
+  //       DRef func = sess->CallPacked(fmodule_get_function, this->disco_mod, name, true);
+  //       bool exists = (func->DebugGetFromRemote(0).as<Function>()) != nullptr;
+  //       if (!exists) {
+  //         return Function(nullptr);
+  //       }
+  //       return SessionFuncAsPackedFunc(sess, func, name);
+  //     };
+  //     if (num_stages == 1) {
+  //       if (Optional<IntTuple> cpu_ids = GetDiscoWorkerCPUBinding(/*num_workers=*/num_shards)) {
+  //         IntTuple cpu_ids_value = cpu_ids.value();
+  //         sess->CallPacked(sess->GetGlobalFunc("runtime.disco.bind_worker_to_cpu_core"),
+  //                         cpu_ids_value);
+  //       }
+  //     }
+  //     this->get_global_func = [this](const std::string& name) -> Function {
+  //       return SessionFuncAsPackedFunc(sess, sess->GetGlobalFunc(name), name);
+  //     };
+  //     this->model_metadata_ = ModelMetadata::FromModule(
+  //         this->disco_mod.value()->DebugGetFromRemote(0).cast<Module>(), std::move(model_config));
+  //     this->_InitFunctions();
+  //   } else {
+  //     ICHECK(!session.defined());
+  //     Optional<Module> executable = std::nullopt;
+  //     Optional<Function> fload_exec;
+  //     if (StartsWith(reload_lib_path, "system://")) {
+  //       static Function f_load_system_lib = Function::GetGlobalRequired("ffi.SystemLib");
+  //       std::string system_lib_prefix = std::string(reload_lib_path).substr(9);
+  //       std::replace(system_lib_prefix.begin(), system_lib_prefix.end(), /*old=*/'-', /*new=*/'_');
+  //       executable = f_load_system_lib(system_lib_prefix + "_").cast<Module>();
+  //       fload_exec = executable.value()->GetFunction("vm_load_executable");
+  //       ICHECK(fload_exec.defined())
+  //           << "Cannot find system lib with " << system_lib_prefix
+  //           << ", please make sure you set model_lib field consistently with the compilation ";
+  //     } else {
+  //       executable = tvm::ffi::Module::LoadFromFile(reload_lib_path);
+  //       fload_exec = executable.value()->GetFunction("vm_load_executable");
+  //       /* precompile opencl kernel programs */
+  //       if (device.device_type == kDLOpenCL) {
+  //         auto f_get = executable.value()->GetFunction("opencl.GetPreCompiledPrograms", true);
+  //         CHECK(f_get.defined()) << "Cannot find opencl.GetPreCompiledPrograms";
+  //         tvm::ffi::String bytes = f_get.value()().cast<String>();
+  //         auto f_set = executable.value()->GetFunction("opencl.SetPreCompiledPrograms", true);
+  //         CHECK(f_set.defined()) << "Cannot find opencl.SetPreCompiledPrograms";
+  //         f_set.value()(tvm::ffi::String(bytes));
+  //       }
+  //       ICHECK(fload_exec.defined()) << "TVM runtime cannot find vm_load_executable";
+  //     }
+  //     this->use_disco = false;
+  //     this->local_vm = fload_exec.value()().cast<Module>();
+  //     this->local_vm.value()
+  //         ->GetFunction("vm_initialization")
+  //         .value()(static_cast<int>(device.device_type), device.device_id,
+  //                 static_cast<int>(tvm::runtime::memory::AllocatorType::kPooled),
+  //                 static_cast<int>(kDLCPU), 0,
+  //                 static_cast<int>(tvm::runtime::memory::AllocatorType::kPooled));
+  //     this->mod_get_func = [this](const std::string& name) -> Function {
+  //       return this->local_vm.value()->GetFunction(name, true).value_or(Function(nullptr));
+  //     };
+  //     this->get_global_func = [](const std::string& name) -> Function {
+  //       return Function::GetGlobalRequired(name);
+  //     };
+  //     this->model_metadata_ =
+  //         ModelMetadata::FromModule(this->local_vm.value(), std::move(model_config));
+  //     this->_InitFunctions();
+  //   }
+  //   ICHECK_EQ(this->model_metadata_.tensor_parallel_shards, num_shards);
+  //   ICHECK_EQ(this->model_metadata_.pipeline_parallel_stages, num_stages);
+  //   // Invoke the CUDA graph allocation init function if it is defined.
+  //   if (cuda_graph_alloc_init_func_.defined()) {
+  //     this->cuda_graph_alloc_init_func_();
+  //   }
+  // }
+
+  ObjectRef LoadParams(const std::string& model_path, Device device, bool use_presharded_weights) {
+    if (this->use_disco) {
+      DRef params{nullptr};
+      if (this->model_metadata_.params.empty()) {
+        std::filesystem::path fs_model_path = model_path;
+        std::string metadata_path = (fs_model_path / "ndarray-cache.json").string();
+        std::string ndarray_cache_metadata = LoadBytesFromFile(metadata_path);
+        Function loader_create = this->get_global_func("runtime.disco.ShardLoader");
+
+        auto load_all_func_name = use_presharded_weights
+                                      ? "runtime.disco.ShardLoaderLoadAllPresharded"
+                                      : "runtime.disco.ShardLoaderLoadAll";
+        Function loader_load_all = this->get_global_func(load_all_func_name);
+        CHECK(loader_create != nullptr);
+        CHECK(loader_load_all != nullptr);
+        // DRef loader = loader_create(metadata_path, ndarray_cache_metadata, "", this->disco_mod);
+        DRef loader = loader_create(metadata_path, ndarray_cache_metadata, "", this->disco_mod).cast<DRef>();
+        // params = loader_load_all(loader);
+        params = loader_load_all(loader).cast<DRef>();
+      } else {
+        auto load_func_name = use_presharded_weights ? "mlc.loader.LoadMultiGPUPresharded"
+                                                     : "mlc.loader.LoadMultiGPU";
+        Function loader = this->get_global_func(load_func_name);
+        params =
+            loader(model_path, this->disco_mod, picojson::value(this->model_config).serialize()).cast<DRef>();
+      }
+      return params;
+    } else {
+      CHECK(!use_presharded_weights) << "Use of pre-sharded weights requires more than one GPU";
+
+      static Function fload_cache = Function::GetGlobalRequired("vm.builtin.tensor_cache.load");
+      ICHECK(fload_cache != nullptr) << "TVM runtime cannot find vm.builtin.tensor_cache.load";
+      fload_cache(model_path, static_cast<int32_t>(device.device_type), device.device_id);
+      Array<Tensor> params;
+      if (this->model_metadata_.params.empty()) {
+        constexpr const char* name_loader = "vm.builtin.param_array_from_cache";
+        // const Function* fload_params = tvm::runtime::Registry::Get(name_loader);
+        static Function fload_params = Function::GetGlobalRequired(name_loader);
+        ICHECK(fload_params != nullptr) << "Cannot find env function: " << name_loader;
+        // params = (*fload_params)("param", -1);
+        params = fload_params("param", -1).cast<Array<Tensor>>();
+      } else {
+        constexpr const char* name_loader = "vm.builtin.param_array_from_cache_by_name";
+        // const Function* fload_params = tvm::runtime::Registry::Get(name_loader);
+        static Function fload_params = Function::GetGlobalRequired(name_loader);
+        ICHECK(fload_params != nullptr) << "Cannot find env function: " << name_loader;
+        Array<String> param_names;
+        param_names.reserve(this->model_metadata_.params.size());
+        for (const auto& param : this->model_metadata_.params) {
+          param_names.push_back(param.name);
+        }
+        // params = (*fload_params)(param_names);
+        params = fload_params(param_names).cast<Array<Tensor>>();
+      }
+      // after we get params, it is safe to simply clear the cached version
+      // as these params are referenced by params_
+      static Function fclear_tensor_cache =
+        Function::GetGlobalRequired("vm.builtin.tensor_cache.clear");
+      ICHECK(fclear_tensor_cache != nullptr) << "Cannot find env function vm.builtin.tensor_cache.clear";
+      fclear_tensor_cache();
+      return params;
+    }
+  }
+
+  void _TryInitKVState() {
+    Function f_flashinfer_paged_kv_cache = mod_get_func("create_flashinfer_paged_kv_cache");
+    Function f_tir_paged_kv_cache = mod_get_func("create_tir_paged_kv_cache");
+    Function f_create_rnn_state = mod_get_func("create_rnn_state");
+
+    if (f_flashinfer_paged_kv_cache.defined() || f_tir_paged_kv_cache.defined() ||
+        f_create_rnn_state.defined()) {
+      // Prefer to use flashinfer paged kv cache, but fall back to tir paged kv cache
+      if (f_flashinfer_paged_kv_cache.defined()) {
+        this->use_kv_state = KVStateKind::kAttention;
+        this->create_kv_cache_func_ = f_flashinfer_paged_kv_cache;
+      } else if (f_tir_paged_kv_cache.defined()) {
+        this->use_kv_state = KVStateKind::kAttention;
+        this->create_kv_cache_func_ = f_tir_paged_kv_cache;
+      } else if (f_create_rnn_state.defined()) {
+        this->use_kv_state = KVStateKind::kRNNState;
+        this->create_kv_cache_func_ = f_create_rnn_state;
+      }
+      this->reset_kv_cache_func_ = get_global_func("vm.builtin.kv_state_clear");
+      this->kv_cache_add_sequence_func_ = get_global_func("vm.builtin.kv_state_add_sequence");
+      this->kv_cache_remove_sequence_func_ = get_global_func("vm.builtin.kv_state_remove_sequence");
+      this->kv_cache_begin_forward_func_ = get_global_func("vm.builtin.kv_state_begin_forward");
+      this->kv_cache_end_forward_func_ = get_global_func("vm.builtin.kv_state_end_forward");
+      this->fkvcache_array_popn_ = get_global_func("vm.builtin.kv_state_popn");
+      // TODO(mlc-team): enable backtracing when using paged kvcache
+      this->support_backtracking_kv_ = true;
+    }
+  }
+
+  void _InitFunctions() {
+    this->prefill_func_ = mod_get_func("prefill");
+    this->embed_func_ = mod_get_func("embed");
+    this->prefill_with_embed_func_ = mod_get_func("prefill_with_embed");
+    this->decode_func_ = mod_get_func("decode");
+    this->softmax_func_ = mod_get_func("softmax_with_temperature");
+    this->encoding_without_cache_func_ = mod_get_func("encoding_without_cache");
+    this->cuda_graph_alloc_init_func_ = mod_get_func("cuda_graph_alloc_init");
+    _TryInitKVState();
+
+    // Fall back to the old way of creating kv cache if neither paged kv cache nor rnn state is used
+    if (!this->use_kv_state) {
+      this->create_kv_cache_func_ = mod_get_func("create_kv_cache");
+      if (this->create_kv_cache_func_ == nullptr) {
+        this->create_kv_cache_func_ = mod_get_func("_initialize_effect");
+      }
+      this->reset_kv_cache_func_ = mod_get_func("reset_kv_cache");
+      if (this->reset_kv_cache_func_ == nullptr) {
+        this->reset_kv_cache_func_ = get_global_func("vm.builtin.attention_kv_cache_array_clear");
+        support_backtracking_kv_ = true;
+      } else {
+        support_backtracking_kv_ = false;
+      }
+      this->fkvcache_array_popn_ = get_global_func("vm.builtin.attention_kv_cache_array_popn");
+    }
+
+    this->nd_view_func_ = get_global_func("vm.builtin.reshape");
+    this->nd_get_shape_func_ = get_global_func("vm.builtin.shape_of");
+  }
+
+  ObjectRef Empty(Shape shape, DataType dtype, Device device) const {
+    Device null_device{DLDeviceType(0), 0};
+    if (this->use_disco) {
+      DRef empty_func = sess->GetGlobalFunc("runtime.disco.empty");
+      return sess->CallPacked(empty_func, shape, dtype, null_device);
+    } else {
+    //   return NDArray::Empty(shape, dtype, device);
+    return Tensor::Empty(shape, dtype, device);
+    }
+  }
+
+  ObjectRef CopyToWorker0(const Tensor& host_array) {
+    Device null_device{DLDeviceType(0), 0};
+    if (this->use_disco) {
+      DRef array =
+          Downcast<DRef>(this->Empty(host_array.Shape(), host_array.DataType(), null_device));
+      sess->CopyToWorker0(host_array, array);
+      return array;
+    } else {
+      return host_array;
+    }
+  }
+
+  bool use_disco = false;
+
+  enum KVStateKind {
+    kNone = 0,
+    kAttention = 1,
+    kRNNState = 2,
+  };
+
+  KVStateKind use_kv_state = kNone;
+  Session sess{nullptr};
+  Optional<DRef> disco_mod = std::nullopt;
+  Optional<tvm::ffi::Module> local_vm = std::nullopt;
+  picojson::object model_config;
+
+  TypedFunction<Function(const std::string&)> mod_get_func;
+  TypedFunction<Function(const std::string&)> get_global_func;
+
+  Function prefill_func_;
+  Function embed_func_;
+  Function prefill_with_embed_func_;
+  Function decode_func_;
+  Function encoding_without_cache_func_;
+  Function softmax_func_;
+  Function cuda_graph_alloc_init_func_;
+  Function create_kv_cache_func_;
+  Function reset_kv_cache_func_;
+  Function kv_cache_add_sequence_func_;
+  Function kv_cache_remove_sequence_func_;
+  Function kv_cache_begin_forward_func_;
+  Function kv_cache_end_forward_func_;
+  bool support_backtracking_kv_;
+  Function fkvcache_array_popn_;
+  ModelMetadata model_metadata_;
+
+  Device local_gpu_device;//tvm20后新增
+  Optional<Map<String, ObjectRef>> cached_buffers = std::nullopt;
+
+  Function nd_view_func_;
+  Function nd_get_shape_func_;
+};
+
+}  // namespace
+
+//------------------------------
+// Chat module
+//------------------------------
+class LLMChatModule;
+
+/*!
+ * \brief Implements the chat conversation wrapper
+ */
+class LLMChat {
+  friend class LLMChatModule;
+
+ public:
+  explicit LLMChat(DLDevice device) : device_(device) {}
+
+  /*!
+   * \return Text describing runtime stats.
+   */
+  std::string RuntimeStatsText() {
+    std::ostringstream os;
+    os << "prefill: " << std::setprecision(1) << std::fixed
+       << this->prefill_total_tokens / (this->prefill_total_time + this->embed_total_time)
+       << " tok/s"
+       << ", decode: " << std::setprecision(1) << std::fixed
+       << this->decode_total_tokens / this->decode_total_time << " tok/s";
+    return os.str();
+  }
+
+  void UpdateConfigFromMetadata() {
+    if (ft_.use_disco) {
+      return;
+    }
+
+    Function fget_metadata = ft_.mod_get_func("_metadata");  // name in SLIM
+    if (fget_metadata == nullptr) {
+      fget_metadata = ft_.mod_get_func("get_metadata");  // backward-compatible name
+      if (fget_metadata == nullptr) {
+        return;  // Skip if neither exists
+      }
+    }
+    String ret_str = fget_metadata().cast<String>();
+    // Get metadata JSON string
+    std::string metadata_str = std::string(ret_str);
+    picojson::value metadata_info;
+    std::string parse_err = picojson::parse(metadata_info, metadata_str);
+    if (!parse_err.empty()) {
+      LOG(WARNING) << "Failed to parse metadata JSON: " << parse_err;
+      return;  // Skip if parsing fails
+    }
+    if (!metadata_info.is<picojson::object>()) {
+      LOG(WARNING) << "Metadata is not a JSON object, skipping";
+      return;
+    }
+    auto metadata = metadata_info.get<picojson::object>();
+
+    std::string key = "max_window_size";//max_window_size或context_window_size是原始用来规定最大上下文长度的key
+    if (!metadata.count(key)) {
+      key = "context_window_size";
+      ICHECK(metadata.count(key))
+          << "Key \"max_window_size\" or \"context_window_size\" not found.";
+    }
+    ICHECK(metadata[key].is<int64_t>());
+    max_window_size_ = std::min(max_window_size_, metadata[key].get<int64_t>());
+
+    if (metadata.count("prefill_chunk_size")) {
+      ICHECK(metadata["prefill_chunk_size"].is<int64_t>());
+      prefill_chunk_size_ =
+          std::min(prefill_chunk_size_, metadata["prefill_chunk_size"].get<int64_t>());
+    }
+    if (metadata.count("sliding_window_size")) {
+      ICHECK(metadata["sliding_window_size"].is<int64_t>());
+      sliding_window_size_ =
+          std::min(sliding_window_size_, metadata["sliding_window_size"].get<int64_t>());
+    }
+    // to be removed after SLM migration
+    if (metadata.count("sliding_window")) {
+      ICHECK(metadata["sliding_window"].is<int64_t>());
+      sliding_window_size_ =
+          std::min(sliding_window_size_, metadata["sliding_window"].get<int64_t>());
+    }
+  }
+
+  /*!
+   * \return Text describing verbose runtime stats.
+   */
+  std::string VerboseRuntimeStatsText() {
+    std::ostringstream os;
+    os << "----------- prefill -----------\n"
+       << "throughput: " << std::setprecision(3) << std::fixed
+       << this->prefill_total_tokens / (this->prefill_total_time + this->embed_total_time)
+       << " tok/s\n"
+       << "total tokens: " << this->prefill_total_tokens << " tok\n"
+       << "total time: " << this->prefill_total_time << " s\n"
+       << "------------ decode ------------\n"
+       << "throughput: " << std::setprecision(3) << std::fixed
+       << this->decode_total_tokens / this->decode_total_time << " tok/s\n"
+       << "total tokens: " << this->decode_total_tokens << " tok\n"
+       << "total time: " << this->decode_total_time << " s\n";
+    return os.str();
+  }
+
+  /*!
+   * \brief Load JSON config and override options.
+   * \param config_json A json config in picojson type that is partially specifies
+   *        some of the options.
+   * \param partial_update Whether it's a partial update or full update, if set to true,
+   *        we perform a partial update on some of the provided options; if set to false, all
+   *        options must be provided.
+   * \note This function overrides existing configurations.
+   */
+  void LoadJSONOverride(const picojson::value& config_json, bool partial_update = false) {
+    picojson::object config = config_json.get<picojson::object>();
+    if (config.count("temperature")) {
+      CHECK(config["temperature"].is<double>());
+      this->temperature_ = config["temperature"].get<double>();
+    } else {
+      CHECK(partial_update) << "Key \"temperature\" not found.";
+    }
+    if (config.count("repetition_penalty")) {
+      CHECK(config["repetition_penalty"].is<double>());
+      CHECK(this->repetition_penalty_ > 0) << "Repetition penalty must be a positive number!";
+      this->repetition_penalty_ = config["repetition_penalty"].get<double>();
+    } else {
+      CHECK(partial_update) << "Key \"repetition_penalty\" not found.";
+    }
+    if (config.count("presence_penalty")) {
+      CHECK(config["presence_penalty"].is<double>());
+      this->presence_penalty_ = config["presence_penalty"].get<double>();
+      CHECK(fabs(this->presence_penalty_) <= 2.0) << "Presence penalty must be in [-2, 2]";
+    }
+    if (config.count("frequency_penalty")) {
+      CHECK(config["frequency_penalty"].is<double>());
+      this->frequency_penalty_ = config["frequency_penalty"].get<double>();
+      CHECK(fabs(this->frequency_penalty_) <= 2.0) << "Frequency penalty must be in [-2, 2]";
+    }
+    if (config.count("vocab_size")) {
+      CHECK(config["vocab_size"].is<int64_t>());
+      this->vocab_size_ = config["vocab_size"].get<int64_t>();
+    } else {
+      CHECK(partial_update) << "Key \"vocab_size\" not found.";
+    }
+    if (config.count("use_presharded_weights")) {
+      CHECK(config["use_presharded_weights"].is<bool>());
+      this->use_presharded_weights_ = config["use_presharded_weights"].get<bool>();
+    } else {
+      this->use_presharded_weights_ = false;
+    }
+    if (config.count("max_window_size")) {
+      CHECK(config["max_window_size"].is<int64_t>());
+      this->max_window_size_ =
+          std::min(this->max_window_size_, config["max_window_size"].get<int64_t>());
+    }
+    if (config.count("context_window_size")) {
+      CHECK(config["context_window_size"].is<int64_t>());
+      this->max_window_size_ =
+          std::min(this->max_window_size_, config["context_window_size"].get<int64_t>());
+    }
+    if (config.count("sliding_window_size")) {
+      CHECK(config["sliding_window_size"].is<int64_t>());
+      CHECK(!config.count("max_window_size"))
+          << "Cannot specify both sliding_window and max_window_size.";
+      this->sliding_window_size_ = config["sliding_window_size"].get<int64_t>();
+      CHECK(this->sliding_window_size_ > 0 || this->sliding_window_size_ == -1)
+          << "Sliding window size needs to be -1 or positive";
+      CHECK(config.count("prefill_chunk_size"))
+          << "Need to specify chunk size if using sliding window attention.";
+    }
+    // to be removed after SLM migration
+    if (config.count("sliding_window")) {
+      CHECK(config["sliding_window"].is<int64_t>());
+      CHECK(!config.count("max_window_size"))
+          << "Cannot specify both sliding_window and max_window_size.";
+      this->sliding_window_size_ = config["sliding_window"].get<int64_t>();
+      CHECK(this->sliding_window_size_ > 0 || this->sliding_window_size_ == -1)
+          << "Sliding window size needs to be -1 or positive";
+      CHECK(config.count("prefill_chunk_size"))
+          << "Need to specify chunk size if using sliding window attention.";
+    }
+    if (config.count("prefill_chunk_size")) {
+      CHECK(config["prefill_chunk_size"].is<int64_t>());
+      this->prefill_chunk_size_ = config["prefill_chunk_size"].get<int64_t>();
+    }
+    if (config.count("attention_sink_size")) {
+      CHECK(config["attention_sink_size"].is<int64_t>());
+      this->attention_sink_size_ = config["attention_sink_size"].get<int64_t>();
+    }
+    if (config.count("top_p")) {
+      CHECK(config["top_p"].is<double>());
+      this->top_p_ = config["top_p"].get<double>();
+    } else {
+      CHECK(partial_update) << "Key \"top_p\" not found.";
+    }
+    if (config.count("mean_gen_len")) {
+      CHECK(config["mean_gen_len"].is<int64_t>());
+      this->mean_gen_len_ = config["mean_gen_len"].get<int64_t>();
+    }
+    // NOTE: for backward compact change by me at 2025-05-31 
+    else {
+      CHECK(partial_update) << "Key \"mean_gen_len\" not found.";
+    }
+    // NOTE: for backward compact
+    // max gen len is optional
+    if (config.count("max_gen_len")) {
+      CHECK(config["max_gen_len"].is<int64_t>());
+      this->max_gen_len_ = config["max_gen_len"].get<int64_t>();
+    }
+    if (config.count("shift_fill_factor")) {
+      CHECK(config["shift_fill_factor"].is<double>());
+      this->shift_fill_factor_ = config["shift_fill_factor"].get<double>();
+    } 
+    // NOTE: for backward compact change by me at 2025-05-31 
+    else {
+      CHECK(partial_update) << "Key \"shift_fill_factor\" not found.";
+    }
+    if (config.count("conv_template_add")) {
+      // NOTE: for backward compact change by me at 2025-05-31 
+      ICHECK(config["conv_template_add"].is<std::string>());
+      std::string conv_template = config["conv_template_add"].get<std::string>();
+      // std::string conv_template = "llama_default"; //这个参数在tvm17量化后的模型是没有的，需要手动加入
+      this->conversation_ = Conversation_add::FromTemplate(conv_template);
+      if (config.count("conv_config")) {
+        // conv_config can override conv_template
+        this->conversation_.LoadJSONOverride(config["conv_config"], true);
+      }
+    } else if (config.count("conv_config")) {
+      // without conv template, conv_config needs to be a complete config
+      this->conversation_.LoadJSONOverride(config["conv_config"], false);
+    } else {
+      CHECK(partial_update) << "Key \"conv_template\" and \"conv_config\" not found.";
+    }
+    if (config.count("bos_token_id")) {
+      CHECK(config["bos_token_id"].is<int64_t>());
+      this->bos_token_id_ = config["bos_token_id"].get<int64_t>();
+    }
+    if (config.count("eos_token_id")) {
+      if (config["eos_token_id"].is<int64_t>()) 
+      {
+        // Single integer format
+        this->eos_token_id_ = config["eos_token_id"].get<int64_t>();
+      }
+      else if(config["eos_token_id"].is<picojson::array>()) 
+      {
+        // Array format - use the first element
+        const auto& eos_array = config["eos_token_id"].get<picojson::array>();
+        CHECK(!eos_array.empty()) << "eos_token_id array cannot be empty";
+        CHECK(eos_array[0].is<int64_t>()) << "eos_token_id array elements must be integers";
+        this->eos_token_id_ = static_cast<int64_t>(eos_array[0].get<double>());
+      }
+      else
+      {
+        LOG(FATAL) << "eos_token_id must be either an integer or an array of integers";
+      }
+    }
+  }
+
+  /*!
+   * \brief Load JSON config and override options.
+   * \param config_str A json config string that partially specifies some of the options.
+   * \param partial_update Whether it's a partial update or full update, if set to true,
+   *        we perform a partial update on some of the provided options; if set to false, all
+   *        options must be provided.
+   * \note This function overrides existing configurations.
+   */
+  picojson::object LoadJSONOverride(const std::string& config_str, bool partial_update = false) {
+    picojson::value config_json;
+    std::string err = picojson::parse(config_json, config_str);
+    if (!err.empty()) {
+      LOG(FATAL) << err;
+    }
+    LoadJSONOverride(config_json, partial_update);
+    return config_json.get<picojson::object>();
+  }
+
+  std::string GetConfigJSON() const { return SerializeConfigToJSONValue().serialize(true); }
+
+  // /*!
+  //  * \brief Reload model, tokenizers and configurations from the specified model path.
+  //  * \param reload_lib The module to reload, it can either be a path to the library or a tvm Module.
+  //  * \param model_path The path to search for models.
+  //  * \param app_config_json The JSON string used to partially override the configuration loaded from
+  //  * disk, default to empty string.
+  //  */
+  // 修改 tvm::ffi::AnyView 替换 TVMArgValue
+  void Reload(tvm::ffi::AnyView reload_lib, String model_path, String app_config_json = "",
+              int64_t max_window_size = -1) {
+    // Step 1. Process config json string.
+    picojson::object model_config;
+    {
+      std::ifstream config_istream((model_path + "/mlc-chat-config.json").c_str());
+      std::ostringstream config_ostream;
+      ICHECK(config_istream);
+      config_ostream << config_istream.rdbuf();
+      std::string config_str = config_ostream.str();
+      model_config = LoadJSONOverride(config_str, false);  // This loads config and sets member variables
+      if (!app_config_json.empty()) {
+        // Override configuration from app_config_json.
+        picojson::object app_config = LoadJSONOverride(app_config_json, true);
+        if (app_config.count("tensor_parallel_shards")) {
+          model_config["tensor_parallel_shards"] = app_config["tensor_parallel_shards"];
+        }
+      }
+    }
+
+    // Override max_window_size if provided as input parameter (after loading config)
+    if (max_window_size > 0) {
+      // Use input parameter value
+      this->max_window_size_ = max_window_size;
+      LOG(INFO) << "Using max window size from input parameter: " << max_window_size << " tokens";
+    } else {
+      // Use value from config file (already loaded by LoadJSONOverride)
+      LOG(INFO) << "Using max window size from config file: " << this->max_window_size_ << " tokens";
+    }
+
+    // Step 2. Set tokenizer.
+    this->tokenizer_ = Tokenizer::FromPath(model_path);
+    // Step 3. Determine num_shards and num_stages from model_config
+    int num_shards = 1;
+    int num_stages = 1;
+    if (model_config.count("tensor_parallel_shards")) {
+      CHECK(model_config["tensor_parallel_shards"].is<int64_t>());
+      num_shards = model_config["tensor_parallel_shards"].get<int64_t>();
+    }
+    if (model_config.count("pipeline_parallel_stages")) {
+      CHECK(model_config["pipeline_parallel_stages"].is<int64_t>());
+      num_stages = model_config["pipeline_parallel_stages"].get<int64_t>();
+    }
+    // Step 4. Initialize vm, we use the packed function mechanism
+    // so there is no explicit abi dependency on these extra
+    // classes other than basic tvm runtime.
+    // The FunctionTable::Init can handle both Module and String types
+      this->ft_.Init(reload_lib, device_, model_config);  
+    UpdateConfigFromMetadata();
+    if (this->sliding_window_size_ == -1) {
+      CHECK(max_window_size_ != std::numeric_limits<int64_t>::max())
+          << "Key \"max_window_size\" not found.";
+    }
+    // Step 4. Initialize sample functions.
+    try {
+      fsample_topp_from_prob_ = Function::GetGlobalRequired("vm.builtin.sample_top_p_from_prob");
+    } catch (...) {
+      LOG(FATAL) << "Cannot find env function vm.builtin.sample_top_p_from_prob";
+    }
+    try {
+      fsample_topp_from_logits_ = Function::GetGlobalRequired("vm.builtin.sample_top_p_from_logits");
+    } catch (...) {
+      LOG(FATAL) << "Cannot find env function vm.builtin.sample_top_p_from_logits";
+    }
+    // Step 5. Load params in nd-array cache.
+    this->params_ = ft_.LoadParams(model_path, device_, use_presharded_weights_);
+
+    // Step 6. KV cache creation.
+    if (ft_.use_kv_state == FunctionTable::KVStateKind::kAttention) {
+      IntTuple max_num_sequence{1};
+      IntTuple max_total_sequence_length{this->max_window_size_};
+      IntTuple prefill_chunk_size{this->prefill_chunk_size_};
+      IntTuple page_size{16};
+      IntTuple support_sliding_window{1};
+      this->kv_cache_ = ft_.create_kv_cache_func_(max_num_sequence, max_total_sequence_length,
+                                                  prefill_chunk_size, page_size,support_sliding_window).cast<ObjectRef>();
+
+    } else if (ft_.use_kv_state == FunctionTable::KVStateKind::kRNNState) {
+      IntTuple max_num_sequence{1};
+      IntTuple max_history_length{1};
+      this->kv_cache_ = ft_.create_kv_cache_func_(max_num_sequence, max_history_length).cast<ObjectRef>();
+    } else {
+      // this->kv_cache_ = ft_.create_kv_cache_func_(); // to-do 报错
+    }
+    // Step 7. Pre-allocate fixed size ndarray
+    this->temperature_arr_ = Tensor::Empty({1}, DataType::Float(32), device_);
+    float temperature = static_cast<float>(this->temperature_);
+    this->temperature_arr_.CopyFromBytes(&temperature, sizeof(float));
+    if (ft_.use_disco) {
+      Device null_device{DLDeviceType(0), 0};
+      this->input_tokens_decode_ =
+          Downcast<DRef>(ft_.Empty(Shape({1, 1}), DataType::Int(32), null_device));
+    }
+    // Step 8. Reset chat
+    this->ResetChat();
+  }
+
+  void ResetChat() {
+    // TODO(mlc-team): add conversation_.Reset to preserve system prompt
+    // and initial message.
+    // this->conversation_ = Conversation::Create(this->conversation_.conv_template);
+    this->conversation_.Reset();
+    this->ResetRuntimeStats();
+    this->ResetKVCache();
+    this->total_seq_len_ = 0;
+    this->sliding_window_cache_offset_ = 0;
+    this->sink_triggered_ = false;
+  }
+
+  /*!
+   * \brief Dynamically resize KV cache without reloading the model
+   * \param new_max_window_size New max window size in tokens
+   */
+  void ResizeKVCache(int64_t new_max_window_size) {
+    CHECK(new_max_window_size > 0) << "Max window size must be positive";
+
+    int64_t old_size = this->max_window_size_;
+    LOG(INFO) << "Resizing KV cache from " << old_size << " to " << new_max_window_size << " tokens";
+
+    // Step 1: Reset state variables
+    this->total_seq_len_ = 0;
+    this->sliding_window_cache_offset_ = 0;
+    this->sink_triggered_ = false;
+
+    // Step 2: Explicitly release old KV cache object
+    this->kv_cache_ = ObjectRef(nullptr);
+
+    // Step 3: Force memory cleanup if resizing to smaller cache
+    if (new_max_window_size < old_size) {
+      // Trigger device synchronization to ensure old memory is freed
+      DeviceAPI::Get(device_)->StreamSync(device_, nullptr);
+      LOG(INFO) << "Freed old KV cache memory (reducing from " << old_size << " to " << new_max_window_size << ")";
+    }
+
+    // Step 4: Update the size parameter
+    this->max_window_size_ = new_max_window_size;
+
+    // Step 5: Recreate KV cache with new size
+    if (ft_.use_kv_state == FunctionTable::KVStateKind::kAttention) {
+      IntTuple max_num_sequence{1};
+      IntTuple max_total_sequence_length{this->max_window_size_};
+      IntTuple prefill_chunk_size{this->prefill_chunk_size_};
+      IntTuple page_size{16};
+      IntTuple support_sliding_window{1};
+      this->kv_cache_ = ft_.create_kv_cache_func_(max_num_sequence, max_total_sequence_length,
+                                                  prefill_chunk_size, page_size, support_sliding_window).cast<ObjectRef>();
+      LOG(INFO) << "KV cache reallocated for " << this->max_window_size_ << " tokens";
+    } else if (ft_.use_kv_state == FunctionTable::KVStateKind::kRNNState) {
+      IntTuple max_num_sequence{1};
+      IntTuple max_history_length{1};
+      this->kv_cache_ = ft_.create_kv_cache_func_(max_num_sequence, max_history_length).cast<ObjectRef>();
+    }
+
+    // Step 6: Initialize the new KV cache by adding sequence 0
+    ft_.reset_kv_cache_func_(kv_cache_);
+    ft_.kv_cache_add_sequence_func_(kv_cache_, 0);
+    LOG(INFO) << "Initialized new KV cache with sequence 0";
+
+    // Step 7: Reset conversation state
+    this->conversation_.Reset();
+    this->ResetRuntimeStats();
+
+    LOG(INFO) << "KV cache resize complete: " << old_size << " -> " << new_max_window_size << " tokens";
+  }
+
+  /*! \brief reset the runtime stats. */
+  void ResetRuntimeStats() {
+    this->prefill_total_tokens = 0;
+    this->decode_total_tokens = 0;
+    this->embed_total_time = 0;
+    this->prefill_total_time = 0;
+    this->decode_total_time = 0;
+    this->sample_total_time = 0;
+  }
+
+  static std::string GetConcatPrompt(const std::vector<std::string>& prompt_array,
+                                     size_t prefix_end, size_t suffix_start) {
+    std::ostringstream os;
+    for (size_t i = 0; i < prefix_end; ++i) {
+      os << prompt_array[i];
+    }
+    for (size_t i = suffix_start; i < prompt_array.size(); ++i) {
+      os << prompt_array[i];
+    }
+    return os.str();
+  }
+
+  /**
+   * \brief Get input tokens based on history
+   * \param place_in_prompt The place of the input message in the prompt.
+   */
+  std::vector<int32_t> GetInputTokens(PlaceInPrompt place_in_prompt = PlaceInPrompt::kAll,
+                                      picojson::object generation_config = picojson::object()) {
+    // prepare generation settings
+    // the generation_config will not override the original config
+    // since is only used for this generation
+    int64_t gen_mean_gen_len;
+    if (generation_config.count("mean_gen_len")) {
+      CHECK(generation_config["mean_gen_len"].is<int64_t>());
+      gen_mean_gen_len = generation_config["mean_gen_len"].get<int64_t>();
+    } else {
+      gen_mean_gen_len = this->mean_gen_len_;
+    }
+
+    // work on input tokens
+    std::vector<int32_t> tokens;
+    std::vector<std::string> prompts;
+
+    if (this->total_seq_len_ == 0) {
+      prompts = this->conversation_.GetPromptArray(place_in_prompt);
+      if (this->conversation_.add_bos) {
+        tokens.insert(tokens.begin(), bos_token_id_);
+      }
+      if (this->conversation_.prefix_tokens.size() != 0) {
+        tokens.insert(tokens.begin(), this->conversation_.prefix_tokens.begin(),
+                      this->conversation_.prefix_tokens.end());
+      }
+    } else {
+      prompts = this->conversation_.GetPromptArrayLastRound(place_in_prompt);
+    }
+    // first try to encode all
+    std::string all_prompt = GetConcatPrompt(prompts, 0, 0);
+    std::vector<int32_t> encoded = this->tokenizer_->Encode(all_prompt);
+    tokens.insert(tokens.end(), encoded.begin(), encoded.end());
+
+    if (this->sliding_window_size_ != -1 ||  // There is no max window size if we use sliding window
+        this->total_seq_len_ + tokens.size() + gen_mean_gen_len < this->max_window_size_) {
+      return tokens;
+    }
+    // need shift window and re-encode
+    this->total_seq_len_ = 0;
+    this->ResetKVCache();
+    tokens.clear();
+    if (this->conversation_.add_bos) {
+      tokens.insert(tokens.begin(), bos_token_id_);
+    }
+    if (this->conversation_.prefix_tokens.size() != 0) {
+      tokens.insert(tokens.begin(), this->conversation_.prefix_tokens.begin(),
+                    this->conversation_.prefix_tokens.end());
+    }
+    std::vector<std::string> all_prompts = this->conversation_.GetPromptArray();
+    // get estimate of the fragment
+    size_t ctx_length = this->tokenizer_->Encode(all_prompts[0]).size();
+    size_t start_re_encode_pos = 0;
+    for (int i = all_prompts.size() - 1; i > 0; --i) {
+      ctx_length += this->tokenizer_->Encode(all_prompts[i]).size();
+      if (ctx_length >= this->shift_fill_factor_ * this->max_window_size_ &&
+          i + 2 < all_prompts.size()) {
+        start_re_encode_pos = i;
+        break;
+      }
+    }
+    // keep system
+    if (this->conversation_.system.empty()) {
+      all_prompt = GetConcatPrompt(all_prompts, 0, start_re_encode_pos);
+    } else {
+      all_prompt = GetConcatPrompt(all_prompts, 1, start_re_encode_pos);
+    }
+    encoded = this->tokenizer_->Encode(all_prompt);
+    tokens.insert(tokens.end(), encoded.begin(), encoded.end());
+    if (tokens.size() >= this->max_window_size_) {
+      LOG(WARNING)
+          << "The prompt tokens are more than `max_window_size`, the input will be truncated.";
+      ICHECK_GT(this->max_window_size_, gen_mean_gen_len);
+      std::vector<int32_t> truncated_tokens(
+          tokens.end() - (this->max_window_size_ - gen_mean_gen_len), tokens.end());
+      return truncated_tokens;
+    } else if (tokens.size() + gen_mean_gen_len >= this->max_window_size_) {
+      LOG(WARNING)
+          << "The prompt tokens are too long and the generated text may be incomplete, due to "
+             "limited `max_window_size`. ";
+    }
+    return tokens;
+  }
+
+  // get statically allocated input token
+  Tensor GetInputTokenNDArray(const std::vector<int32_t>& token_ids) {
+    // try realloc
+    if (!input_token_ids_.defined()) {
+      int64_t init_size = 2048;
+      while (init_size < static_cast<int64_t>(token_ids.size())) {
+        init_size *= 2;
+      }
+      input_token_ids_ = Tensor::Empty({1, init_size}, DataType::Int(32), device_);
+    } else {
+      int64_t init_size = input_token_ids_->shape[1];
+      while (init_size < static_cast<int64_t>(token_ids.size())) {
+        init_size *= 2;
+      }
+      if (init_size != input_token_ids_->shape[1]) {
+        input_token_ids_ = Tensor::Empty({1, init_size}, DataType::Int(32), device_);
+      }
+    }
+    ICHECK_LE(token_ids.size(), input_token_ids_->shape[1]) << "Input tokens exceed window size";
+    Tensor view = input_token_ids_.CreateView(
+        Shape({1, static_cast<int64_t>(token_ids.size())}), input_token_ids_->dtype);
+    if (token_ids.size() > 0) {
+      view.CopyFromBytes(token_ids.data(), token_ids.size() * sizeof(int32_t));
+    }
+    return view;
+  }
+
+  std::vector<int32_t> PrepareBeforeEmbedding(
+      std::string inp, bool append_conversation = true,
+      PlaceInPrompt place_in_prompt = PlaceInPrompt::kAll,
+      picojson::object generation_config = picojson::object()) {
+    if (conversation_.separator_style == SeparatorStyle::kLM ||
+        conversation_.separator_style == SeparatorStyle::kCodeCompletion) {
+      this->ResetChat();
+    }
+    if (reset_stats_per_prefill_) {
+      this->ResetRuntimeStats();
+    }
+    output_ids_.clear();
+    appeared_token_freq_.clear();
+    output_message_.clear();
+    stop_triggered_ = false;
+    if (append_conversation) { //这个引起段错误 2025-05-31
+      conversation_.AppendMessage(conversation_.roles[0], inp);
+      conversation_.AppendReplyHeader(conversation_.roles[1]);
+    }
+
+    return this->GetInputTokens(place_in_prompt, generation_config);
+  }
+
+  /*!
+   * \brief Given the text input, generate the embedding of the tokenized prompt.
+   * \param inp The input text string.
+   * \param append_conversation Whether to append the input message to conversation.
+   * \param place_in_prompt The place of the input message in the prompt.
+   * \return the embedding of the tokenized prompt.
+   */
+  ObjectRef EmbedStep(std::string inp, bool append_conversation = true,
+                      PlaceInPrompt place_in_prompt = PlaceInPrompt::kAll,
+                      String generation_config_str = "") {
+    // process generation settings
+    picojson::object generation_config;
+    if (!generation_config_str.empty()) {
+      generation_config = this->LoadJSONOverride(generation_config_str, true);
+    }
+
+    // std::cout<<"generation_config_str: "<<inp<<std::endl;
+    // LOG(INFO) <<"generation_config_str: "<<inp;
+    std::vector<int32_t> prompt_tokens =
+        PrepareBeforeEmbedding(inp, append_conversation, place_in_prompt, generation_config);
+    int64_t token_len = static_cast<int64_t>(prompt_tokens.size());
+    if (token_len == 0)
+    {
+      return Tensor::Empty({}, DataType::Float(32), device_);
+    }
+
+    CHECK(ft_.embed_func_.defined())
+        << "In order to use the embedding functionality, make sure you "
+           "build the model in MLC-LLM with `sep_embed` option on.";
+    auto tstart = std::chrono::high_resolution_clock::now();
+
+    Tensor input_data = this->GetInputTokenNDArray(prompt_tokens);
+
+    // add by me 20250419
+    ObjectRef input_obj = ft_.CopyToWorker0(input_data);
+    int input_len = prompt_tokens.size();
+    // IntTuple seq_ids_tuple({0});
+    Shape input_len_shape{input_len};
+    // ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, input_len_shape);
+    input_obj = ft_.nd_view_func_(input_obj, input_len_shape).cast<ObjectRef>();
+    ObjectRef embedding = ft_.embed_func_(input_obj, params_).cast<ObjectRef>();
+
+    // ObjectRef embedding = ft_.embed_func_(ft_.CopyToWorker0(input_data), params_);
+
+    int32_t new_seq_len = total_seq_len_ + token_len;
+    total_seq_len_ = new_seq_len;
+
+    auto tend = std::chrono::high_resolution_clock::now();
+
+    this->embed_total_time += static_cast<double>((tend - tstart).count()) / 1e9;
+
+    return embedding;
+  }
+
+  /*!
+   * \brief 修改total_seq_len_字段，用于加入新的编码片段.
+   * \param add_len 新长度.
+   * \return void.
+   */
+
+  void add_total_seq_len(int add_len) {
+    if (add_len > 0) {
+      total_seq_len_ += add_len;
+    }
+  }
+
+  /*!
+   * \brief 修改total_seq_len_字段
+   * \param add_len 新长度.
+   * \return void.
+   */
+
+  void set_total_seq_len(int set_len) {
+    if (set_len >= 0) {
+      total_seq_len_ = set_len;
+    }
+  }
+
+  /*!
+   * \brief Prefill given embeddings. Can optionally decode the output next token.
+   * \param embedding The embedding to prefill with.
+   * \param decode_next_token Whether to decode next token.
+   */
+  void PrefillWithEmbedStep(Tensor embedding, bool decode_next_token = true,
+                            String generation_config_str = "") {
+    if (ft_.use_disco) {
+      LOG(FATAL) << "NotImplementedError: Distributed inference is not supported for this model";
+      throw;
+    }
+    if (embedding.Shape().size() == 0) {
+      return;
+    }
+    auto tstart = std::chrono::high_resolution_clock::now();
+    int64_t token_len = embedding.Shape()[1];
+    // std::cout << "token_len: " << embedding.Shape() << std::endl;
+    //这个函数都不存在，自己手写吧 total_seq_len_ 在embedding的时候会更新,记录当前字符长度,这个不存在是因为转换模型造成的，用python转模型就没有问题，因此禁掉add by me
+    // 需要修改total_seq_len_，用于加入其他编码，如加入图像编码
+    // Tensor logits_on_device = this->ForwardEmbeddings(embedding, total_seq_len_);
+
+    // add by me 20250419
+    ObjectRef ret{nullptr};
+    int input_len = embedding.Shape()[0];
+    IntTuple seq_ids_tuple({0});
+    Shape input_len_shape{input_len};
+    ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, input_len_shape);
+
+    Shape embedding_shape = {1, input_len, GetHiddenSizeFromEmbedding(embedding)};
+    auto embed = ft_.nd_view_func_(embedding, embedding_shape).cast<ObjectRef>();
+    ret = ft_.prefill_func_(embed, kv_cache_, params_).cast<ObjectRef>();
+    ft_.kv_cache_end_forward_func_(kv_cache_);
+
+    Tensor logits_on_device = Downcast<Array<Tensor>>(ret)[0];
+
+
+    if (!decode_next_token) {
+      auto tend = std::chrono::high_resolution_clock::now();
+      this->prefill_total_time += static_cast<double>((tend - tstart).count()) / 1e9;
+      this->prefill_total_tokens += token_len;
+      return;
+    }
+
+    picojson::object generation_config;
+    if (!generation_config_str.empty()) {
+      generation_config = this->LoadJSONOverride(generation_config_str, true);
+    }
+
+    // Sample the first token from logits and add to output_ids_
+    int32_t next_token = this->SampleTokenFromLogits(logits_on_device, generation_config);
+
+    auto tend = std::chrono::high_resolution_clock::now();
+
+    this->prefill_total_time += static_cast<double>((tend - tstart).count()) / 1e9;
+    this->prefill_total_tokens += token_len;
+    this->ProcessNextToken(next_token, generation_config);
+  }
+
+  /*!
+   * \brief Generate the next token given a prompt. Can optionally decode the output next token.
+   * \param inp The input text string.
+   * \param append_conversation Whether to append the input message to conversation.
+   * \param decode_next_token Whether to decode next token.
+   * \param place_in_prompt The place of the input message in the prompt.
+   */
+  void PrefillStep(std::string inp, bool append_conversation = true, bool decode_next_token = true,
+                   PlaceInPrompt place_in_prompt = PlaceInPrompt::kAll,
+                   String generation_config_str = "") {
+    if (ft_.embed_func_.defined() && ft_.prefill_with_embed_func_.defined()) 
+    {
+      // Temporarily placed inside `PrefillStep` for compatibility in transition.
+      // Will be separated out in the future.
+      if (ft_.use_disco) {
+        LOG(FATAL) << "NotImplementedError: Distributed inference is not supported for this model";
+      }
+      if (this->prefill_chunk_size_ != -1) {
+        LOG(FATAL) << "NotImplementedError: Separate embedding does not support chunking";
+      }
+      Tensor embedding = Downcast<Tensor>(
+          EmbedStep(inp, append_conversation, place_in_prompt, generation_config_str));
+          PrefillWithEmbedStep(embedding, decode_next_token, generation_config_str);
+      return;
+    }
+
+    picojson::object generation_config =
+        this->LoadGenerationConfigFromString(generation_config_str);
+
+    std::vector<int32_t> prompt_tokens =
+        this->PrepareBeforeEmbedding(inp, append_conversation, place_in_prompt, generation_config);//这个引起段错误 2025-05-31
+    int64_t token_len = static_cast<int64_t>(prompt_tokens.size());
+    if (token_len == 0) return;
+    if (ft_.use_disco) {
+      // exclude load shard time from prefill
+      this->ft_.sess->SyncWorker(0);
+    }
+    auto tstart = std::chrono::high_resolution_clock::now();
+
+    int32_t new_seq_len = total_seq_len_;
+    Tensor logits_on_device;
+    if (this->prefill_chunk_size_ > 0) {
+      // Perform chunking.
+      for (int64_t begin = 0; begin < token_len; begin += this->prefill_chunk_size_) {
+        int64_t end = std::min(token_len, begin + this->prefill_chunk_size_);
+        std::vector<int32_t> chunk =
+            std::vector<int32_t>(prompt_tokens.begin() + begin, prompt_tokens.begin() + end);
+        new_seq_len += static_cast<int64_t>(chunk.size());
+        logits_on_device = this->ForwardTokens(chunk, new_seq_len);
+
+        // update window cache offset (prefill)
+        if (this->sliding_window_size_ != -1) {
+          if (sink_triggered_) {
+            sliding_window_cache_offset_ =
+                std::max((sliding_window_cache_offset_ + static_cast<int64_t>(chunk.size())) %
+                             sliding_window_size_,
+                         attention_sink_size_);
+          } else {
+            sliding_window_cache_offset_ += static_cast<int64_t>(chunk.size());
+            sink_triggered_ = sliding_window_cache_offset_ >= attention_sink_size_;
+          }
+        }
+      }
+      ICHECK_EQ(new_seq_len, total_seq_len_ + token_len) << "Expect chunking process all tokens";
+    } else {
+      // Otherwise, prefill entire prompt at once.
+      CHECK(sliding_window_size_ == -1) << "Expect chunking with sliding window attention";
+      new_seq_len += token_len;
+      logits_on_device = this->ForwardTokens(prompt_tokens, new_seq_len);
+    }
+    total_seq_len_ = new_seq_len;
+
+    if (!decode_next_token) {
+      auto tend = std::chrono::high_resolution_clock::now();
+      this->prefill_total_time += static_cast<double>((tend - tstart).count()) / 1e9;
+      this->prefill_total_tokens += token_len;
+      return;
+    }
+
+    int32_t next_token = this->SampleTokenFromLogits(logits_on_device, generation_config);
+
+    auto tend = std::chrono::high_resolution_clock::now();
+
+    this->prefill_total_time += static_cast<double>((tend - tstart).count()) / 1e9;
+    this->prefill_total_tokens += token_len;
+    this->ProcessNextToken(next_token, generation_config);
+  }
+
+  void DecodeStep(String generation_config_str = "") {
+    picojson::object generation_config =
+        this->LoadGenerationConfigFromString(generation_config_str);
+
+    ICHECK(!output_ids_.empty());
+    int32_t last_token = output_ids_.back();
+    Tensor input_data = GetInputTokenNDArray({last_token});
+
+    auto tstart = std::chrono::high_resolution_clock::now();
+
+    Tensor logits_on_device = this->ForwardTokens({last_token}, total_seq_len_ + 1);
+    total_seq_len_ += 1;
+
+    // update window cache offset (decoding)
+    if (this->sliding_window_size_ != -1) {
+      if (sink_triggered_) {
+        sliding_window_cache_offset_ = std::max(
+            (sliding_window_cache_offset_ + 1) % sliding_window_size_, attention_sink_size_);
+      } else {
+        sliding_window_cache_offset_ += 1;
+        sink_triggered_ = sliding_window_cache_offset_ >= attention_sink_size_;
+      }
+    }
+
+    int32_t next_token = this->SampleTokenFromLogits(logits_on_device, generation_config);
+
+    auto tend = std::chrono::high_resolution_clock::now();
+
+    this->decode_total_time += static_cast<double>((tend - tstart).count()) / 1e9;
+    this->decode_total_tokens += 1;
+    this->ProcessNextToken(next_token, generation_config);
+  }
+
+  bool Stopped() { return stop_triggered_; }
+
+  std::string GetMessage() {
+    // remove non-utf8 characters
+    size_t effective_end = FindEffectiveUTF8Pos(output_message_);
+    while (effective_end > 0 && output_message_[effective_end - 1] == '\n') {
+      --effective_end;
+    }
+    size_t effective_begin = 0;
+    while (effective_begin < effective_end && output_message_[effective_begin] == ' ') {
+      ++effective_begin;
+    }
+    std::string cropped_message =
+        output_message_.substr(effective_begin, effective_end - effective_begin);
+    return cropped_message;
+  }
+
+  // do some quick evaluation of the pipeline
+  void Evaluate(int64_t token_len, int64_t generate_len) {
+    this->ResetKVCache();
+    std::vector<int32_t> tokens;
+    for (int i = 0; i < token_len - 1; ++i) {
+      tokens.push_back(2);
+    }
+    tokens.insert(tokens.begin(), bos_token_id_);
+
+    std::vector<int32_t> first_sample_data = {6234};
+
+    // warm up: skip first run
+    this->ForwardTokens(tokens, token_len);
+    this->ForwardTokens(first_sample_data, token_len + 1);
+    this->ResetKVCache();
+
+    // encoding
+    auto encoding_start = std::chrono::high_resolution_clock::now();
+    this->ForwardTokens(tokens, token_len);
+    DeviceAPI::Get(device_)->StreamSync(device_, nullptr);
+    auto encoding_end = std::chrono::high_resolution_clock::now();
+    double encoding_ms = static_cast<double>((encoding_end - encoding_start).count()) / 1e6;
+    LOG(INFO) << "encoding-time=" << encoding_ms << "ms, ";
+
+    double decoding_ms_total = 0;
+    // start encoding
+    for (int i = 0; i < generate_len; ++i) {
+      auto decoding_start = std::chrono::high_resolution_clock::now();
+      this->UpdateLogitsOrProbOnCPUSync(this->ForwardTokens(first_sample_data, token_len + i + 1));
+      DeviceAPI::Get(device_)->StreamSync(device_, nullptr);
+      auto decoding_end = std::chrono::high_resolution_clock::now();
+      double decoding_ms = static_cast<double>((decoding_end - decoding_start).count()) / 1e6;
+      decoding_ms_total += decoding_ms;
+      LOG(INFO) << "[i: " << token_len + i + 1 << "] decoding-time=" << decoding_ms << "ms"
+                << " tok/s: " << 1000.0 * (i + 1) / decoding_ms_total << ".";
+    }
+  }
+
+  std::string RawGenerate(std::string prompt, int64_t generate_len) {
+    CHECK_GE(generate_len, 0) << "The input generate is expected to be non-negative.";
+
+    this->ResetKVCache();
+    this->ResetRuntimeStats();
+
+    std::vector<int32_t> tokens = tokenizer_->Encode(prompt);
+    int64_t input_length = tokens.size();
+
+    Tensor logits_on_device;
+    // prefill
+    {
+      std::cout<<"raw prefill"<<std::endl;
+      auto tstart = std::chrono::high_resolution_clock::now();
+      logits_on_device = this->ForwardTokens(tokens, tokens.size());
+      // std::cout<<"logits_on_device: "<<logits_on_device.Shape()<<std::endl;
+      tokens.push_back(this->SampleTokenFromLogits(logits_on_device));
+      auto tend = std::chrono::high_resolution_clock::now();
+
+      this->prefill_total_time = static_cast<double>((tend - tstart).count()) / 1e9;
+      this->prefill_total_tokens = input_length;
+    }
+
+    // decode
+    {
+      std::cout<<"raw decode"<<std::endl;
+      auto tstart = std::chrono::high_resolution_clock::now();
+      for (int64_t len = 1; len < generate_len; ++len) {
+        logits_on_device = this->ForwardTokens({tokens.back()}, tokens.size());
+        tokens.push_back(this->SampleTokenFromLogits(logits_on_device));
+      }
+      auto tend = std::chrono::high_resolution_clock::now();
+
+      this->decode_total_time = static_cast<double>((tend - tstart).count()) / 1e9;
+      this->decode_total_tokens = generate_len;
+    }
+
+    std::string output = tokenizer_->Decode({tokens.begin() + input_length, tokens.end()});
+    return output;
+  }
+
+ private:
+  picojson::value SerializeConfigToJSONValue() const {
+    picojson::object config;
+    config["temperature"] = picojson::value(this->temperature_);
+    config["repetition_penalty"] = picojson::value(this->repetition_penalty_);
+    config["presence_penalty"] = picojson::value(this->presence_penalty_);
+    config["frequency_penalty"] = picojson::value(this->frequency_penalty_);
+    config["top_p"] = picojson::value(this->top_p_);
+    config["mean_gen_len"] = picojson::value(this->mean_gen_len_);
+    config["max_gen_len"] = picojson::value(this->max_gen_len_);
+    config["shift_fill_factor"] = picojson::value(this->shift_fill_factor_);
+    config["conv_config"] = this->conversation_.SerializeToJSON();
+    return picojson::value(config);
+  }
+
+  picojson::object LoadGenerationConfigFromString(const std::string& generation_config_str) {
+    picojson::object generation_config = picojson::object();
+    if (!generation_config_str.empty()) {
+      picojson::value generation_config_json;
+      picojson::parse(generation_config_json, generation_config_str);
+      generation_config = generation_config_json.get<picojson::object>();
+    }
+    return generation_config;
+  }
+
+  void ReadGenerationConfig(picojson::object generation_config, double* gen_temperature,
+                            Tensor* gen_temperature_arr, double* gen_repetition_penalty,
+                            double* gen_presence_penalty, double* gen_frequency_penalty,
+                            double* gen_top_p) {
+    if (generation_config.count("temperature")) {
+      CHECK(generation_config["temperature"].is<double>());
+      *gen_temperature = generation_config["temperature"].get<double>();
+
+      *gen_temperature_arr = Tensor::Empty({1}, DataType::Float(32), device_);
+      float temperature_cast = static_cast<float>(*gen_temperature);
+      gen_temperature_arr->CopyFromBytes(&temperature_cast, sizeof(float));
+    } else {
+      *gen_temperature = this->temperature_;
+      *gen_temperature_arr = this->temperature_arr_;
+    }
+    if (generation_config.count("repetition_penalty")) {
+      CHECK(generation_config["repetition_penalty"].is<double>());
+      CHECK(generation_config["repetition_penalty"].get<double>() > 0)
+          << "Repetition penalty must be a positive number!";
+      *gen_repetition_penalty = generation_config["repetition_penalty"].get<double>();
+    } else {
+      *gen_repetition_penalty = this->repetition_penalty_;
+    }
+    if (generation_config.count("presence_penalty")) {
+      CHECK(generation_config["presence_penalty"].is<double>());
+      CHECK(fabs(generation_config["presence_penalty"].get<double>()) <= 2)
+          << "Presence penalty must be in the range -2 to 2!";
+      *gen_presence_penalty = generation_config["presence_penalty"].get<double>();
+    } else {
+      *gen_presence_penalty = this->presence_penalty_;
+    }
+    if (generation_config.count("frequency_penalty")) {
+      CHECK(generation_config["frequency_penalty"].is<double>());
+      CHECK(fabs(generation_config["frequency_penalty"].get<double>()) <= 2)
+          << "Frequency penalty must be in the range -2 to 2!";
+      *gen_frequency_penalty = generation_config["frequency_penalty"].get<double>();
+    } else {
+      *gen_frequency_penalty = this->frequency_penalty_;
+    }
+    if (generation_config.count("top_p")) {
+      CHECK(generation_config["top_p"].is<double>());
+      *gen_top_p = generation_config["top_p"].get<double>();
+    } else {
+      *gen_top_p = this->top_p_;
+    }
+  }
+
+  /*!
+   * \brief Sample output token from logits on device
+   */
+  int32_t SampleTokenFromLogits(Tensor logits_on_device,
+                                picojson::object generation_config = picojson::object()) {
+    // prepare generation settings
+    // the generation_config will not override the original config
+    // since is only used for this generation
+    double gen_temperature;
+    double gen_repetition_penalty;
+    double gen_presence_penalty;
+    double gen_frequency_penalty;
+    double gen_top_p;
+    this->ReadGenerationConfig(generation_config, &gen_temperature, &this->temperature_arr_,
+                               &gen_repetition_penalty, &gen_presence_penalty,
+                               &gen_frequency_penalty, &gen_top_p);
+
+    // update logits
+    if (gen_presence_penalty != 0.0f || gen_frequency_penalty != 0.0f) {
+      this->UpdateLogitsOrProbOnCPUSync(logits_on_device);
+      this->ApplyPresenceAndFrequencyPenaltyOnCPU(gen_presence_penalty, gen_frequency_penalty);
+      if (gen_temperature >= 1e-6f) {
+        this->ApplySoftmaxWithTemperatureOnCPU(gen_temperature);
+      }
+    } else if (gen_repetition_penalty != 1.0f) {
+      this->UpdateLogitsOrProbOnCPUSync(logits_on_device);
+      this->ApplyRepetitionPenaltyOnCPU(gen_repetition_penalty);
+      if (gen_temperature >= 1e-6f) {
+        this->ApplySoftmaxWithTemperatureOnCPU(gen_temperature);
+      }
+    } else {
+      if (gen_temperature < 1e-6f) {
+        this->UpdateLogitsOrProbOnCPUSync(logits_on_device);
+      } else {
+        this->UpdateLogitsOrProbOnCPUSync(this->Softmax(logits_on_device, this->temperature_arr_));
+      }
+    }
+
+    // perform sampling
+    auto tstart = std::chrono::high_resolution_clock::now();
+    int next_token;
+    if (gen_temperature < 1e-6f) {
+      next_token = this->SampleFromLogitsOnCPU(gen_temperature, gen_top_p);
+    } else {
+      next_token = this->SampleFromProbOnCPU(gen_top_p);
+    }
+    auto tend = std::chrono::high_resolution_clock::now();
+    this->sample_total_time += static_cast<double>((tend - tstart).count()) / 1e9;
+    return next_token;
+  }
+
+  /*!
+   * \brief Add a generated token and check for stop condition.
+   * \param next_token The next token.
+   */
+  void ProcessNextToken(int32_t next_token,
+                        picojson::object generation_config = picojson::object()) {
+    // prepare generation settings
+    // the generation_config will not override the original config
+    // since is only used for this generation
+    int64_t gen_max_gen_len;
+    if (generation_config.count("max_gen_len")) {
+      CHECK(generation_config["max_gen_len"].is<int64_t>());
+      gen_max_gen_len = generation_config["max_gen_len"].get<int64_t>();
+    } else {
+      gen_max_gen_len = this->max_gen_len_;
+    }
+
+    std::vector<std::string> gen_stop_strs;
+    gen_stop_strs.push_back(conversation_.stop_str);
+
+    if (generation_config.count("stop")) {
+      if (!generation_config["stop"].is<picojson::null>()) {
+        CHECK(generation_config["stop"].is<std::string>() ||
+              generation_config["stop"].is<picojson::array>());
+        if (generation_config["stop"].is<std::string>()) {
+          gen_stop_strs.push_back(generation_config["stop"].get<std::string>());
+        } else {
+          picojson::array gen_stop_strs_arr = generation_config["stop"].get<picojson::array>();
+          for (const picojson::value& v : gen_stop_strs_arr) {
+            CHECK(v.is<std::string>());
+            gen_stop_strs.push_back(v.get<std::string>());
+          }
+        }
+      }
+    }
+
+    ICHECK(!stop_triggered_) << "Cannot call process when it is stopped";
+
+    stop_triggered_ =
+        std::any_of(this->conversation_.stop_tokens.begin(), this->conversation_.stop_tokens.end(),
+                    [next_token](int32_t token) { return token == next_token; });
+
+    if (!stop_triggered_) {
+      output_ids_.push_back(next_token);
+      if (appeared_token_freq_.find(next_token) != appeared_token_freq_.end()) {
+        appeared_token_freq_[next_token] += 1;
+      } else {
+        appeared_token_freq_[next_token] = 1;
+      }
+    }
+
+    output_message_ = tokenizer_->Decode(output_ids_);
+
+    size_t stop_pos = std::string::npos;
+    for (const std::string& stop_str : gen_stop_strs) {
+      if (!stop_str.empty()) {
+        stop_pos = std::min(stop_pos, output_message_.rfind(stop_str));
+      }
+    }
+
+    if (stop_pos != std::string::npos) {
+      stop_triggered_ = true;
+      if (ft_.support_backtracking_kv_) {
+        // back tracking, find the first set of token that is smaller
+        // than the length
+        size_t backoff = 0;
+        for (; (output_ids_.size() > 0) && (output_message_.length() > stop_pos); ++backoff) {
+          output_ids_.pop_back();
+          output_message_ = tokenizer_->Decode(output_ids_);
+        }
+        // resize kv to remove the context
+        if (ft_.use_kv_state) {
+          ft_.fkvcache_array_popn_(kv_cache_, /*seq_id=*/0, backoff);
+        } else {
+          ft_.fkvcache_array_popn_(kv_cache_, backoff);
+        }
+        total_seq_len_ -= backoff;
+      }
+    }
+
+    if (static_cast<int64_t>(output_ids_.size()) >= gen_max_gen_len) {
+      stop_triggered_ = true;
+    }
+    // max_window_size_ != -1 to handle
+    // https://github.com/mlc-ai/mlc-llm/blob/main/mlc_llm/relax_model/rwkv.py#L588-L589
+    // sliding_window_size_ == -1 to make sure we do not stop when using sliding window
+    else if (max_window_size_ != -1 && sliding_window_size_ == -1 &&
+             total_seq_len_ >= max_window_size_) {
+      stop_triggered_ = true;
+    }
+    if (stop_triggered_) {
+      conversation_.FinishReply(output_message_);
+    }
+  }
+
+  // run forward compute profill:1->2->3->14,decode:6->8->9->10->14
+  Tensor ForwardTokens(std::vector<int32_t> input_tokens, int64_t cur_pos) {
+    ObjectRef ret{nullptr};
+    if (input_tokens.size() > 1 && ft_.prefill_func_.defined()) {
+      // std::cout<<"mark:"<<"1"<<std::endl;
+      ObjectRef input_data = ft_.CopyToWorker0(this->GetInputTokenNDArray(input_tokens));
+      if (sliding_window_size_ == -1) {
+        // std::cout<<"mark:"<<"2"<<std::endl;
+        if (ft_.use_kv_state) {
+          // std::cout<<"mark:"<<"3"<<std::endl;
+          int input_len = input_tokens.size();
+          // std::cout<<"input_len fuckkkk: "<<input_len<<std::endl;
+          IntTuple seq_ids_tuple({0});
+          Shape input_len_shape{input_len};
+          ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, input_len_shape);
+          input_data = ft_.nd_view_func_(input_data, input_len_shape).cast<ObjectRef>();
+          auto embed = ft_.embed_func_(input_data, params_).cast<ObjectRef>();
+          Shape embedding_shape = {1, input_len, GetHiddenSizeFromEmbedding(embed)};
+          embed = ft_.nd_view_func_(embed, embedding_shape).cast<ObjectRef>();
+          ret = ft_.prefill_func_(embed, kv_cache_, params_).cast<ObjectRef>();
+          ft_.kv_cache_end_forward_func_(kv_cache_);
+        } else {
+          // std::cout<<"mark:"<<"4"<<std::endl;
+          Shape cur_pos_shape = Shape({cur_pos});
+          ret = ft_.prefill_func_(input_data, cur_pos_shape, kv_cache_, params_).cast<ObjectRef>();
+        }
+      } else {
+        // std::cout<<"mark:"<<"5"<<std::endl;
+        // Sliding window attention needs extra shape parameters
+        int64_t seq_len = static_cast<int64_t>(input_tokens.size());
+        // Number of elements in the cache
+        int64_t cache_len = std::min(this->sliding_window_size_, cur_pos - seq_len);
+        Shape cache_len_shape = Shape({cache_len});
+        Shape kv_seq_len_shape = Shape({cache_len + seq_len});
+        Shape cache_offset_shape = Shape({sliding_window_cache_offset_});
+        ret = ft_.prefill_func_(input_data, cache_len_shape, kv_seq_len_shape, cache_offset_shape,
+                                kv_cache_, params_).cast<ObjectRef>();
+      }
+    } else {
+      // std::cout<<"mark:"<<"6"<<std::endl;
+      // running decode function when prefill is not available
+      for (int i = 0; i < input_tokens.size(); ++i) {
+        ObjectRef input_data;
+        if (ft_.use_disco) {
+          // std::cout<<"mark:"<<"7"<<std::endl;
+          ft_.sess->CopyToWorker0(this->GetInputTokenNDArray({input_tokens[i]}),
+                                  input_tokens_decode_.value());
+          input_data = input_tokens_decode_.value();
+        } else {
+          // std::cout<<"mark:"<<"8"<<std::endl;
+          input_data = ft_.CopyToWorker0(this->GetInputTokenNDArray({input_tokens[i]}));
+        }
+        int64_t pos = cur_pos + i + 1 - input_tokens.size();
+        Shape pos_shape = Shape({pos});
+        if (sliding_window_size_ == -1) {
+          // std::cout<<"mark:"<<"9"<<std::endl;
+          if (ft_.use_kv_state) {
+            // std::cout<<"mark:"<<"10"<<std::endl;
+            IntTuple seq_ids_tuple({0});
+            IntTuple append_length({1});
+            ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, append_length);
+            input_data = ft_.nd_view_func_(input_data, append_length).cast<ObjectRef>();
+            auto embed = ft_.embed_func_(input_data, params_).cast<ObjectRef>();
+            Shape embedding_shape = {1, 1, GetHiddenSizeFromEmbedding(embed)};
+            embed = ft_.nd_view_func_(embed, embedding_shape).cast<ObjectRef>();
+            ret = ft_.decode_func_(embed, kv_cache_, params_).cast<ObjectRef>();
+            ft_.kv_cache_end_forward_func_(kv_cache_);
+          } else {
+            // std::cout<<"mark:"<<"11"<<std::endl;
+            ret = ft_.decode_func_(input_data, pos_shape, kv_cache_, params_).cast<ObjectRef>();
+          }
+        } else {
+          // std::cout<<"mark:"<<"12"<<std::endl;
+          // Sliding window attention needs extra shape parameters
+          int64_t seq_len = static_cast<int64_t>(input_tokens.size());
+          // Number of elements in the cache
+          int64_t cache_len = std::min(this->sliding_window_size_, pos - seq_len);
+          Shape cache_len_shape = Shape({cache_len});
+          Shape kv_seq_len_shape = Shape({cache_len + seq_len});
+          Shape cache_offset_shape = Shape({sliding_window_cache_offset_});
+          ret = ft_.decode_func_(input_data, cache_len_shape, kv_seq_len_shape, cache_offset_shape,
+                                 kv_cache_, params_).cast<ObjectRef>();
+        }
+      }
+    }
+    if (ft_.use_disco) {
+      // std::cout<<"mark:"<<"13"<<std::endl;
+      Array<ObjectRef> result = Downcast<DRef>(ret)->DebugGetFromRemote(0).cast<Array<ObjectRef>>();
+      return Downcast<Tensor>(result[0]);
+    } else {
+      // std::cout<<"mark:"<<"14"<<std::endl;
+      return Downcast<Array<Tensor>>(ret)[0];
+    }
+  }
+
+  int GetHiddenSizeFromEmbedding(ObjectRef embedding) {
+    if (this->hidden_size_ != -1) {
+      return this->hidden_size_;
+    }
+    // Get the shape of the embedding tensor for hidden size.
+    // ShapeTuple embedding_shape; //21后废弃
+    Shape embedding_shape;
+    if (ft_.use_disco) {
+      ICHECK(embedding->IsInstance<DRefObj>());
+      ObjectRef shape_ref = ft_.nd_get_shape_func_(embedding).cast<ObjectRef>();
+      embedding_shape = tvm::Downcast<DRef>(shape_ref)->DebugGetFromRemote(0).cast<Shape>();
+    } else {
+      Tensor embedding_nd = tvm::Downcast<Tensor>(embedding);
+      embedding_shape = embedding_nd.Shape();
+    }
+    ICHECK_EQ(embedding_shape.size(), 2);
+    ICHECK_GT(embedding_shape[0], 1);
+    this->hidden_size_ = embedding_shape[1];
+    return this->hidden_size_;
+  }
+
+  // run forward compute with embeddings
+  Tensor ForwardEmbeddings(Tensor embeddings, int64_t cur_pos) {
+    if (ft_.use_disco) {
+      LOG(FATAL) << "NotImplementedError: Distributed inference is not supported for this model";
+      throw;
+    }
+    Array<ObjectRef> ret;
+    CHECK(ft_.prefill_with_embed_func_.defined());
+    ret = ft_.prefill_with_embed_func_(embeddings, Shape({cur_pos}), kv_cache_, params_).cast<Array<ObjectRef>>();
+    return Downcast<Tensor>(ret[0]);
+  }
+
+  Tensor Softmax(Tensor input, Tensor temperature_arr) {
+    Tensor ret;
+    try {
+      ret = ft_.softmax_func_(input, temperature_arr).cast<Tensor>();
+    } catch (const dmlc::Error& e) {
+      // This branch is for compatibility:
+      // The old softmax function takes temperature arr with shape (),
+      // and the new softmax func takes temperature arr with shape (1,).
+      // Remove this branch after updating all prebuilt model libraries.
+      temperature_arr = temperature_arr.CreateView({}, temperature_arr->dtype);
+      ret = ft_.softmax_func_(input, temperature_arr).cast<Tensor>();
+    }
+    return ret;
+  }
+
+  void ApplyRepetitionPenaltyOnCPU(float repetition_penalty) {
+    CHECK(logits_on_cpu_.defined()) << "Logits on CPU not defined!";
+    CHECK(logits_on_cpu_.DataType() == DataType::Float(32)) << "Logits data type is not float32!";
+    float* logits_raw_data = static_cast<float*>(logits_on_cpu_->data);
+    for (const auto& token_freq : this->appeared_token_freq_) {
+      if (logits_raw_data[token_freq.first] <= 0) {
+        logits_raw_data[token_freq.first] *= repetition_penalty;
+      } else {  // logits > 0
+        logits_raw_data[token_freq.first] /= repetition_penalty;
+      }
+    }
+  }
+
+  void ApplyPresenceAndFrequencyPenaltyOnCPU(float presence_penalty, float frequency_penalty) {
+    CHECK(logits_on_cpu_.defined()) << "Logits on CPU not defined!";
+    CHECK(logits_on_cpu_.DataType() == DataType::Float(32)) << "Logits data type is not float32!";
+    float* logits_raw_data = static_cast<float*>(logits_on_cpu_->data);
+    for (const auto& token_freq : this->appeared_token_freq_) {
+      logits_raw_data[token_freq.first] -=
+          (token_freq.second * frequency_penalty + presence_penalty);
+    }
+  }
+
+  void ApplySoftmaxWithTemperatureOnCPU(float temperature) {
+    CHECK(logits_on_cpu_.defined()) << "Logits on CPU not defined!";
+    CHECK(logits_on_cpu_.DataType() == DataType::Float(32)) << "Logits data type is not float32!";
+    int vocab_size = logits_on_cpu_->shape[logits_on_cpu_->ndim - 1];
+    float* logits_raw_data = static_cast<float*>(logits_on_cpu_->data);
+    float m = std::numeric_limits<float>::min();
+    float inv_temp = 1.0f / temperature;
+    double d = 0.0f;
+    for (int i = 0; i < vocab_size; ++i) {
+      float x = logits_raw_data[i] * inv_temp;
+      float m_prev = m;
+      m = std::max(m, x);
+      d = d * std::exp(m_prev - m) + std::exp(x - m);
+    }
+    for (int i = 0; i < vocab_size; ++i) {
+      float x = logits_raw_data[i] * inv_temp;
+      logits_raw_data[i] = std::exp(x - m) / d;
+    }
+  }
+
+  void UpdateLogitsOrProbOnCPUSync(Tensor logits_or_prob) {
+    if (!logits_on_cpu_.defined()) {
+      logits_on_cpu_ = logits_or_prob.CopyTo(DLDevice{kDLCPU, 0});
+    } else {
+      ICHECK_EQ(logits_on_cpu_->shape[0], logits_or_prob->shape[0])
+          << "Expect size of logits remain unchanged";
+      logits_on_cpu_.CopyFrom(logits_or_prob);
+    }
+    DeviceAPI::Get(device_)->StreamSync(device_, nullptr);
+  }
+
+  // Clear kv cache
+  void ResetKVCache() {
+    ft_.reset_kv_cache_func_(kv_cache_);
+    // if (ft_.use_kv_state) //抽离的函数没有这个变量，后期确定是否需要
+    {
+      ft_.kv_cache_add_sequence_func_(kv_cache_, 0);
+    }
+  }
+
+  void ProcessSystemPrompts() {
+    this->PrefillStep(/*inp=*/"", /*append_conversation=*/false, /*decode_next_token=*/false);
+  }
+
+  // Utils
+  static double GetRandomNumber() { return RandomGenerator::GetInstance().GetRandomNumber(); }
+
+  int32_t SampleFromLogitsOnCPU(float temperature, float top_p) {
+    ICHECK(logits_on_cpu_.defined()) << "logits_on_cpu_ is not defined";
+    ICHECK_EQ(logits_on_cpu_->ndim, 3) << "logits_on_cpu_ should be 3D";
+    ICHECK_EQ(logits_on_cpu_->shape[0], 1) << "logits_on_cpu_ should be 1 batch";
+    return fsample_topp_from_logits_(logits_on_cpu_, temperature, top_p, GetRandomNumber()).cast<int>();
+  }
+
+  int32_t SampleFromProbOnCPU(float top_p) {
+    ICHECK(logits_on_cpu_.defined()) << "logits_on_cpu_ is not defined";
+    ICHECK_EQ(logits_on_cpu_->ndim, 3) << "logits_on_cpu_ should be 3D";
+    ICHECK_EQ(logits_on_cpu_->shape[0], 1) << "logits_on_cpu_ should be 1 batch";
+    return fsample_topp_from_prob_(logits_on_cpu_, top_p, GetRandomNumber()).cast<int>();//tvm::ffi::Any需要通过cast显示转换
+  }
+
+  //----------------------------
+  // Statistics
+  //----------------------------
+  bool reset_stats_per_prefill_ = true;
+  double embed_total_time = 0;
+  double decode_total_time = 0;
+  double sample_total_time = 0;
+  double prefill_total_time = 0;
+  int64_t decode_total_tokens = 0;
+  int64_t prefill_total_tokens = 0;
+  //----------------------------
+  // Conversation
+  //----------------------------
+  // conversation
+  Conversation_add conversation_;
+  // total sequence len,
+  int64_t total_seq_len_{0};
+  // max window size, mean and max generation length, sliding window
+  // If we use sliding window, max window size is its default max() value
+  int64_t max_window_size_{std::numeric_limits<int64_t>::max()}, mean_gen_len_{128},
+      max_gen_len_{512}, sliding_window_size_{-1}, prefill_chunk_size_{-1}, attention_sink_size_{0};
+  // size of the vocab table
+  int64_t vocab_size_;
+  // Load weights that were saved in sharded form
+  bool use_presharded_weights_;
+  // shift window fill factor
+  double shift_fill_factor_{0.3};
+  // temperature
+  double temperature_{0.8};
+  // pre-allocated ndarray for temperature
+  // NDArray temperature_arr_;
+  Tensor temperature_arr_;
+  // repetition penalty
+  double repetition_penalty_{1.0};
+  // presence penalty
+  double presence_penalty_{0.0};
+  // frequency penalty
+  double frequency_penalty_{0.0};
+  // top_p
+  double top_p_{0.95};
+  // output ids till now (refresh after encoding step)
+  std::vector<int32_t> output_ids_;
+  // frequency of appeared token ids till now (refresh after encoding step)
+  std::unordered_map<int32_t, int64_t> appeared_token_freq_;
+  // output message till now (refresh after encoding step)
+  std::string output_message_;
+  // Whether encounter stop str
+  bool stop_triggered_{false};
+  // Whether sink is in action
+  bool sink_triggered_{false};
+  // sliding window cache offset
+  int64_t sliding_window_cache_offset_{0};
+  //----------------------------
+  // Model configurations
+  //----------------------------
+  int hidden_size_ = -1;
+  //----------------------------
+  // Tokenizer
+  //----------------------------
+  // internal tokenizer
+  Tokenizer tokenizer_;
+  // bos token
+  int32_t bos_token_id_{1};
+  // eos token id
+  int32_t eos_token_id_{2};
+  //----------------------------
+  // TVM related states
+  //----------------------------
+  // runtime device
+  Device device_;
+
+  // serve::FunctionTable ft_;//tvm21后独立为函数 - incompatible with LLMChat's usage
+  FunctionTable ft_; // Use local FunctionTable for LLMChat
+  // sample top p from logits
+  Function fsample_topp_from_logits_;
+  // sample top p from prob
+  Function fsample_topp_from_prob_;
+  // input token id
+  Tensor input_token_ids_{nullptr};
+  // local params
+  ObjectRef params_;
+  // KV cache
+  ObjectRef kv_cache_;
+  // Temp logits on cpu
+  Tensor logits_on_cpu_{nullptr};
+  // pre-allocated ndarray for decode function's input tokens
+  Optional<DRef> input_tokens_decode_ = std::nullopt;
+  // KV cache config
+  //serve::KVCacheConfig kv_cache_config_{nullptr};
+};
+
+/*!
+ * \brief A chat module implementation that exposes
+ *  the functions as tvm::runtime::Module.
+ *
+ * We do it so that the module is accessible to any
+ * language that tvm runtime can access.
+ */
+class LLMChatModule : public ffi::ModuleObj {
+ public:
+  // clear global memory manager
+  static void ClearGlobalMemoryManager() {
+    // Step 0. Clear the previously allocated memory.
+    std::optional<Function> fclear_memory_manager =
+        Function::GetGlobal("vm.builtin.memory_manager.clear");
+    ICHECK(fclear_memory_manager.has_value()) << "Cannot find env function vm.builtin.memory_manager.clear";
+    (*fclear_memory_manager)();
+  }
+
+  // overrides
+  Optional<Function> GetFunction(const String& name) override {
+    if (name == "reload") { // 重新加载模型
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        chat_ = nullptr;
+        ClearGlobalMemoryManager();
+        chat_ = std::make_unique<LLMChat>(LLMChat(device_));
+        ICHECK(2 <= args.size() && args.size() <= 5);
+        if (args.size() == 2) {
+          // args: reload_lib, model_path
+          chat_->Reload(args[0], args[1].cast<String>());
+        } else if (args.size() == 3) {
+          // args: reload_lib, model_path, app_config_json (used for overriding config)
+          chat_->Reload(args[0], args[1].cast<String>(), args[2].cast<String>());
+        } else if (args.size() == 4) {
+          // args: reload_lib, model_path, app_config_json, max_window_size
+          chat_->Reload(args[0], args[1].cast<String>(), args[2].cast<String>(), args[3].cast<int64_t>());
+        }
+      });} 
+      else if (name == "unload") {
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        chat_ = nullptr;
+        ClearGlobalMemoryManager();
+      });} 
+      else if (name == "evaluate") { //评估pipline是否正常
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        ICHECK_EQ(args.size(), 2);
+        GetChat()->Evaluate(args[0].cast<int64_t>(), args[1].cast<int64_t>());
+      });
+    }
+    else if (name == "raw_generate") { // 原始生成 一把生成结果
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        ICHECK_EQ(args.size(), 2);
+        std::string s = GetChat()->RawGenerate(args[0].cast<std::string>(), args[1].cast<int64_t>());
+        *rv = s;
+      });
+    } else if (name == "prefill") { //kv填充
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        ICHECK(1 <= args.size() && args.size() <= 4);
+        if (args.size() == 1) {
+          // args: inp (with decode_next_token = true, place_in_prompt = kAll)
+          GetChat()->PrefillStep(args[0].cast<std::string>());
+        } else if (args.size() == 2) {
+          // args: inp, decode_next_token (with place_in_prompt = kAll)
+          GetChat()->PrefillStep(args[0].cast<std::string>(), true, args[1].cast<bool>());
+        } else if (args.size() == 3) {
+          // args: inp, decode_next_token, place_in_prompt
+          PlaceInPrompt place_in_prompt = static_cast<PlaceInPrompt>(args[2].cast<int>());
+          GetChat()->PrefillStep(args[0].cast<std::string>(), true, args[1].cast<bool>(), place_in_prompt);
+        } else if (args.size() == 4) {
+          // args: inp, decode_next_token, place_in_prompt, generation_config_str
+          PlaceInPrompt place_in_prompt = static_cast<PlaceInPrompt>(args[2].cast<int>());
+          GetChat()->PrefillStep(args[0].cast<std::string>(), true, args[1].cast<bool>(), place_in_prompt, args[3].cast<String>());
+        }
+      });
+    } else if (name == "embed") { //编码
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        ICHECK(1 <= args.size() && args.size() <= 3);
+        if (args.size() == 1) {
+          // args: inp (with place_in_prompt = kAll)
+          *rv = GetChat()->EmbedStep(args[0].cast<std::string>());
+        } else if (args.size() == 2) {
+          // args: inp, place_in_prompt
+          PlaceInPrompt place_in_prompt = static_cast<PlaceInPrompt>(args[1].cast<int>());
+          *rv = GetChat()->EmbedStep(args[0].cast<std::string>(), true, place_in_prompt);
+        } else if (args.size() == 3) {
+          // args: inp, place_in_prompt, generation_config_str
+          PlaceInPrompt place_in_prompt = static_cast<PlaceInPrompt>(args[1].cast<int>());
+          *rv = GetChat()->EmbedStep(args[0].cast<std::string>(), true, place_in_prompt, args[2].cast<String>());
+        }
+      });
+    } else if (name == "prefill_with_embed") { // kv填充
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        ICHECK(1 <= args.size() && args.size() <= 3);
+        if (args.size() == 1) {
+          // args: embedding (with decode_next_token = true)
+          GetChat()->PrefillWithEmbedStep(args[0].cast<Tensor>());
+        } else if (args.size() == 2) {
+          // args: embedding, decode_next_token
+          GetChat()->PrefillWithEmbedStep(args[0].cast<Tensor>(), args[1].cast<bool>());
+        } else if (args.size() == 3) {
+          // args: embedding, decode_next_token, generation_config_str
+          GetChat()->PrefillWithEmbedStep(args[0].cast<Tensor>(), args[1].cast<bool>(), args[2].cast<String>());
+        }
+      });
+    } else if (name == "decode") {// 生成下一个字或者词
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        ICHECK(0 <= args.size() && args.size() <= 1);
+        if (args.size() == 0) {
+          GetChat()->DecodeStep();
+        } else if (args.size() == 1) {
+          // args: generation_config_str
+          GetChat()->DecodeStep(args[0].cast<String>());
+        }
+      });
+    } else if (name == "reset_chat") { // 重置对话
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        ICHECK_EQ(args.size(), 0);
+        GetChat()->ResetChat();
+      });
+    } else if (name == "resize_kv_cache") { // 动态调整KV cache大小
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        ICHECK_EQ(args.size(), 1);
+        int64_t new_size = args[0].cast<int64_t>();
+        GetChat()->ResizeKVCache(new_size);
+      });
+    } else if (name == "load_json_override") {
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        ICHECK_EQ(args.size(), 2);
+        std::string config_str = args[0].cast<std::string>();
+        bool partial_update = args[1].cast<bool>();
+        GetChat()->LoadJSONOverride(config_str, partial_update);
+      });
+    } else if (name == "get_role0") {
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        *rv = GetChat()->conversation_.roles[0];
+      });
+    } else if (name == "get_role1") {
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        *rv = GetChat()->conversation_.roles[1];
+      });
+    } else if (name == "stopped") { // 获取 对话是否结束
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        *rv = GetChat()->Stopped();
+      });
+    } else if (name == "get_message") { // 获取对话的内容
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        *rv = GetChat()->GetMessage();
+      });
+    } else if (name == "runtime_stats_text") {
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        *rv = GetChat()->RuntimeStatsText();
+      });
+    } else if (name == "verbose_runtime_stats_text") {
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        *rv = GetChat()->VerboseRuntimeStatsText();
+      });
+    } else if (name == "reset_runtime_stats") {
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        GetChat()->ResetRuntimeStats();
+      });
+    } else if (name == "get_config_json") {
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        *rv = GetChat()->GetConfigJSON();
+      });
+    } else if (name == "process_system_prompts") {
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        GetChat()->ProcessSystemPrompts();
+      });
+    } else if(name == "add_total_seq_len") { // add by me 2025.5.23
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        GetChat()->add_total_seq_len(args[0].cast<int>());
+      });
+    } else if(name == "set_total_seq_len") { // add by me 2025.5.27
+      return Function::FromPacked([this](PackedArgs args, Any* rv) -> void {
+        GetChat()->set_total_seq_len(args[0].cast<int>());
+      });
+    }else {
+      return std::nullopt;
+     }
+  }
+
+  void Init(DLDevice device) { device_ = device; }
+
+  LLMChat* GetChat() {
+    ICHECK(chat_ != nullptr) << "Chat is not initialized via reload";
+    return chat_.get();
+  }
+
+  const char* kind() const override { return "mlc.llm_chat"; }
+
+ private:
+  std::unique_ptr<LLMChat> chat_ = nullptr;
+  DLDevice device_;
+};
+
+std::vector<std::string> CountUTF8(const std::string& s) {
+  // assume that the string is always valid utf8
+  std::vector<std::string> ret;
+  for (size_t pos = 0; pos < s.size();) {
+    if ((s[pos] & 0x80) == 0x00) {
+      ret.push_back(s.substr(pos, 1));
+      pos += 1;
+    } else if (pos + 1 < s.size() && (s[pos] & 0xE0) == 0xC0 && (s[pos + 1] & 0xC0) == 0x80) {
+      ret.push_back(s.substr(pos, 2));
+      pos += 2;
+    } else if (pos + 1 < s.size() && (s[pos] & 0xF0) == 0xE0 && (s[pos + 1] & 0xC0) == 0x80 &&
+               (s[pos + 2] & 0xC0) == 0x80) {
+      ret.push_back(s.substr(pos, 3));
+      pos += 3;
+    } else if (pos + 2 < s.size() && (s[pos] & 0xF8) == 0xF0 && (s[pos + 1] & 0xC0) == 0x80 &&
+               (s[pos + 2] & 0xC0) == 0x80 && (s[pos + 3] & 0xC0) == 0x80) {
+      ret.push_back(s.substr(pos, 4));
+      pos += 4;
+    } else {
+      LOG(FATAL) << "Invalid UTF8 string";
+    }
+  }
+  return std::move(ret);
+}
+
+/*!
+ * \brief Get the diff of new message and current message (the delta message).
+ * \param curr_message The current message.
+ * \param new_message The new message
+ * \return The delta message.
+ * \note The main complication here is that new_mdg can be different from previous message, so we
+ need to find the diff, delete previous messages that are different, then print it out.
+ This logic is only needed for simple stdout.
+
+ For UI apps that can directly update output text we can simply do last_reply.text =
+ chat->GetMessage();
+ */
+std::string GetDeltaMessage(std::string curr_message, std::string new_message) {
+  std::vector<std::string> cur_utf8_chars = CountUTF8(curr_message);
+  std::vector<std::string> new_utf8_chars = CountUTF8(new_message);
+  // Step 1. Find the index of the first UTF8 char that differs
+  size_t pos = std::mismatch(cur_utf8_chars.begin(), cur_utf8_chars.end(), new_utf8_chars.begin(),
+                             new_utf8_chars.end())
+                   .first -
+               cur_utf8_chars.begin();
+  // Step 2. Delete the previous message since `pos`
+  std::string print = "";
+  for (size_t j = pos; j < cur_utf8_chars.size(); ++j) {
+    print += "\b \b";
+  }
+  // Step 3. Print the new message since `pos`
+  for (size_t j = pos; j < new_utf8_chars.size(); ++j) {
+    print += new_utf8_chars[j];
+  }
+  return print;
+}
+
+// register as a system function that can be queried
+namespace {
+static auto __unused_global_def_mlc_get_delta_message =
+    tvm::ffi::reflection::GlobalDef().def("mlc.get_delta_message", GetDeltaMessage);
+}
+
+Module CreateChatModule(DLDevice device) {
+  ObjectPtr<LLMChatModule> n = tvm::ffi::make_object<LLMChatModule>();
+  n->Init(device);
+  return Module(n);
+}
+
+// register as a system function that can be queried
+namespace {
+static auto __unused_global_def_mlc_llm_chat_create =
+    tvm::ffi::reflection::GlobalDef().def("mlc.llm_chat_create", [](int device_type, int device_id) {
+      return CreateChatModule(DLDevice{static_cast<DLDeviceType>(device_type), device_id});
+    });
+
+static auto __unused_global_def_mlc_random_set_seed =
+    tvm::ffi::reflection::GlobalDef().def("mlc.random.set_seed", [](int seed) {
+      RandomGenerator::GetInstance().SetSeed(seed);
+    });
+}
+
+// for MLC RUST API: to force the Rust compiler to link the whole translation unit
+extern "C" {
+void LLMChatDummyLinkFunc() {}
+}
+
+}  // namespace llm
+}  // namespace mlc

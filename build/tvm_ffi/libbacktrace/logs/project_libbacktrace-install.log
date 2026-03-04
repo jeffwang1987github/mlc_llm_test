@@ -1,0 +1,28 @@
+make[3]: 警告: jobserver 不可用: 正使用 -j1。添加 “+” 到父 make 的规则。
+ /usr/bin/mkdir -p '/home/wangqx/work/mlc_llm_test/build/tvm_ffi/libbacktrace/lib'
+ /bin/bash ./libtool   --mode=install /usr/bin/install -c   libbacktrace.la '/home/wangqx/work/mlc_llm_test/build/tvm_ffi/libbacktrace/lib'
+libtool: install: /usr/bin/install -c .libs/libbacktrace.lai /home/wangqx/work/mlc_llm_test/build/tvm_ffi/libbacktrace/lib/libbacktrace.la
+libtool: install: /usr/bin/install -c .libs/libbacktrace.a /home/wangqx/work/mlc_llm_test/build/tvm_ffi/libbacktrace/lib/libbacktrace.a
+libtool: install: chmod 644 /home/wangqx/work/mlc_llm_test/build/tvm_ffi/libbacktrace/lib/libbacktrace.a
+libtool: install: x86_64-linux-gnu-ranlib --plugin /usr/lib/gcc/x86_64-linux-gnu/11/liblto_plugin.so /home/wangqx/work/mlc_llm_test/build/tvm_ffi/libbacktrace/lib/libbacktrace.a
+libtool: finish: PATH="/home/wangqx/.nvm/versions/node/v24.12.0/bin:/opt/ros/noetic/bin:/usr/lib/llvm-17/bin:/usr/local/cmake-3.29.7-linux-x86_64/bin:/usr/src/tensorrt/bin:/usr/local/cuda-12.1/bin:/home/wangqx/.cargo/bin:/home/wangqx/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/opt/apps/com.volcengine.feilian/files/mdm/opt/corplink-mdm/bin:/sbin" ldconfig -n /home/wangqx/work/mlc_llm_test/build/tvm_ffi/libbacktrace/lib
+----------------------------------------------------------------------
+Libraries have been installed in:
+   /home/wangqx/work/mlc_llm_test/build/tvm_ffi/libbacktrace/lib
+
+If you ever happen to want to link against installed libraries
+in a given directory, LIBDIR, you must either use libtool, and
+specify the full pathname of the library, or use the `-LLIBDIR'
+flag during linking and do at least one of the following:
+   - add LIBDIR to the `LD_LIBRARY_PATH' environment variable
+     during execution
+   - add LIBDIR to the `LD_RUN_PATH' environment variable
+     during linking
+   - use the `-Wl,-rpath -Wl,LIBDIR' linker flag
+   - have your system administrator add LIBDIR to `/etc/ld.so.conf'
+
+See any operating system documentation about shared libraries for
+more information, such as the ld(1) and ld.so(8) manual pages.
+----------------------------------------------------------------------
+ /usr/bin/mkdir -p '/home/wangqx/work/mlc_llm_test/build/tvm_ffi/libbacktrace/include'
+ /usr/bin/install -c -m 644 /home/wangqx/work/mlc_llm_test/3rdparty/mlc_llm/3rdparty/tvm/3rdparty/tvm-ffi/cmake/Utils/../../3rdparty/libbacktrace/backtrace.h backtrace-supported.h '/home/wangqx/work/mlc_llm_test/build/tvm_ffi/libbacktrace/include'
