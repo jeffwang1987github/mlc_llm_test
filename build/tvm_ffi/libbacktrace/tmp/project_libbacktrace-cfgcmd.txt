@@ -1,1 +1,0 @@
-cmd='sh;/home/wangqx/work/mlc_llm_test/3rdparty/mlc_llm/3rdparty/tvm/3rdparty/tvm-ffi/cmake/Utils/../../3rdparty/libbacktrace/configure;--prefix=/home/wangqx/work/mlc_llm_test/build/tvm_ffi/libbacktrace;--with-pic;CC=/usr/bin/cc;CPP=/usr/bin/cc -E;CFLAGS= -fvisibility=hidden -fvisibility-inlines-hidden;LDFLAGS=;NM=/usr/bin/nm;STRIP=/usr/bin/strip;--host=x86_64-linux-gnu'
